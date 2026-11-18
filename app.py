@@ -1,16 +1,17 @@
-"""Cadence internal linking workbench. Run: python -m streamlit run app.py
+"""Internal linking opportunities — select a client, optionally enter an anchor,
+then click Find opportunities. Navigation/footer core-page discovery, crawling,
+GSC enrichment, matching, audit, charts and workbook generation run together.
 
-GITHUB / STREAMLIT CLOUD: Put app.py and requirements.txt at repository root;
-select app.py as the entrypoint. Try Demo & help before connecting real data.
-Cloud mode imports Screaming Frog CSV exports; it cannot launch a desktop app.
-Optional Streamlit Secrets:
-    app_password = "choose-a-private-password"
-    gsc_token_json = '''{contents of an already-authorized GSC token JSON}'''
-Keep OAuth credentials out of GitHub. Connect Google under Clients & settings.
+GitHub: commit app.py and requirements.txt; Streamlit entrypoint is app.py.
+Optional one-time Secrets:
+    app_password = "a-private-password"
+    gsc_token_json = '<the complete authorized GSC token JSON>'
 
-Every network call, crawl, analysis and export is gated by an explicit action.
-The same file is a detached worker: python app.py --worker /path/to/job.json.
-Credentials and results stay in the configured local data directory.
+Google credentials stay in memory and travel to a background worker through a
+stdin pipe. Never commit credentials. Cloud mode uses a bounded HTML crawler;
+local mode uses the installed Screaming Frog CLI when available. Saved crawl
+results are reused for 24 hours unless Refresh is selected in the collapsed
+connection/crawl drawer. Host storage can be reset on redeploy/reboot.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import csv
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import io
 import json
 import math
@@ -26,6 +28,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -33,7 +36,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -45,7 +48,8 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("INTERNAL_LINK_DATA_DIR", str(APP_DIR / "data"))).expanduser().resolve()
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+GOOGLE_CREDENTIALS_INFO = None  # Worker memory only; never included in job JSON.
 UA = "CadenceInternalLinks/1.0"
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -89,6 +93,14 @@ def slug(value):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def progress_update(log, done, total, message):
+    """Count real work when a total exists; do not invent crawl percentages."""
+    if callable(getattr(log, "progress", None)):
+        log.progress(int(done), int(total), message)
+    else:
+        log(message)
 
 
 def atomic_json(path, value, private=False):
@@ -170,7 +182,15 @@ def is_home(url, profile):
 
 
 def is_blog(url, profile):
-    return bool(re.search(profile.get("blog_pattern", r"/(blog|resources|articles|insights)/"), urlsplit(url).path, re.I))
+    if url_key(url) in profile.get("blog_urls", []):
+        return True
+    path = urlsplit(url).path
+    leaf = path.strip("/").split("/")[-1].lower()
+    if leaf in {"blog", "blogs", "resources", "articles", "insights", "news"}:
+        return False
+    if re.search(r"/(?:tag|tags|author|authors|category|categories|page)/", path, re.I):
+        return False
+    return bool(re.search(profile.get("blog_pattern", r"/(blog|resources|articles|insights)/"), path, re.I))
 
 
 def excluded(url, profile):
@@ -351,7 +371,7 @@ def find_sf(override=""):
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return str(Path(candidate).resolve())
-    raise FileNotFoundError("Screaming Frog CLI was not found. Set its executable path in Clients & settings.")
+    raise FileNotFoundError("Screaming Frog CLI was not found. Set its executable path under Connection & crawl options.")
 
 
 def run_sf(profile, options, log, check_cancel):
@@ -372,10 +392,21 @@ def run_sf(profile, options, log, check_cancel):
         process = subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, shell=False)
         try:
             started = time.monotonic()
+            last_report = 0
             while process.poll() is None:
                 check_cancel()
                 if time.monotonic() - started > int(options.get("crawl_timeout_minutes", 180)) * 60:
                     raise TimeoutError("Crawl exceeded the configured timeout. See the crawl log.")
+                if time.monotonic() - last_report > 2:
+                    last_report = time.monotonic()
+                    with (output / "sf.log").open("rb") as running_log:
+                        running_log.seek(0, 2)
+                        running_log.seek(max(0, running_log.tell() - 4000))
+                        tail = running_log.read().decode("utf-8", errors="replace")
+                    crawl_lines = "\n".join(line for line in tail.splitlines() if re.search(r"crawl|complete", line, re.I))
+                    percentages = re.findall(r"(\d+(?:\.\d+)?)\s*%", crawl_lines)
+                    detail = tail.strip().splitlines()[-1] if tail.strip() else f"Screaming Frog is running ({int(time.monotonic() - started)} seconds)."
+                    progress_update(log, min(100, int(float(percentages[-1]))) if percentages else 0, 100 if percentages else 0, detail[-300:])
                 time.sleep(0.5)
         except BaseException:
             process.terminate()
@@ -403,15 +434,44 @@ def run_sf(profile, options, log, check_cancel):
     log(f"Imported {counts[0]:,} pages and {counts[1]:,} hyperlink records.")
 
 
+def validate_public_url(url):
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+        raise ValueError("Enter a public http(s) website URL.")
+    if os.environ.get("INTERNAL_LINK_ALLOW_PRIVATE") == "1":
+        return
+    try:
+        literal = ipaddress.ip_address(parts.hostname)
+        addresses = [literal]
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80), type=socket.SOCK_STREAM)]
+        except OSError as exc:
+            raise ValueError("The website's public address could not be resolved.") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("Only public websites can be crawled; private and local network addresses are blocked.")
+
+
 def get_bytes(url, max_bytes=5_000_000):
     import requests
-    with requests.get(url, headers={"User-Agent": UA}, timeout=(10, 35), allow_redirects=True, stream=True) as response:
-        data = bytearray()
-        for part in response.iter_content(65536):
-            data.extend(part)
-            if len(data) > max_bytes:
-                raise ValueError(f"Response exceeded the {max_bytes:,}-byte limit.")
-        return response.status_code, {k.lower(): v for k, v in response.headers.items()}, response.url, bytes(data)
+    current, first_redirect = url, None
+    for _ in range(7):
+        validate_public_url(current)
+        with requests.get(current, headers={"User-Agent": UA}, timeout=(10, 35), allow_redirects=False, stream=True) as response:
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            if response.status_code in {301, 302, 303, 307, 308} and headers.get("location"):
+                first_redirect = first_redirect or response.status_code
+                current = urljoin(current, headers["location"])
+                continue
+            data = bytearray()
+            for part in response.iter_content(65536):
+                data.extend(part)
+                if len(data) > max_bytes:
+                    raise ValueError(f"Response exceeded the {max_bytes:,}-byte limit.")
+            if first_redirect:
+                headers["__redirect_status__"] = str(first_redirect)
+            return response.status_code, headers, response.url, bytes(data)
+    raise ValueError("The website returned too many redirects.")
 
 
 def css_path(tag):
@@ -437,7 +497,7 @@ def extract_content(html, url, selector=""):
     if main is None:
         return {"success": False, "error": "Main content selector did not match.", "paragraphs": [], "text": ""}
     headings = [text_norm(x.get_text(" ", strip=True)) for x in main.find_all(["h1", "h2", "h3"])]
-    for node in list(main.select("script, style, noscript, svg, nav, footer, header, aside, form, button, [hidden], [aria-hidden='true'], .related-posts, .related-articles, .breadcrumbs, .social-share")):
+    for node in list(main.select("script, style, noscript, svg, nav, footer, header, aside, form, button, [hidden], [aria-hidden='true'], [role='navigation'], [role='contentinfo'], .footer, .site-footer, .footer_wrap, .footer_component, .footer-wrapper, .navbar, .site-header, .related-posts, .related-articles, .breadcrumbs, .social-share")):
         if node.parent is not None:
             node.decompose()
     outgoing = [url_key(urljoin(url, a.get("href", ""))) for a in main.find_all("a", href=True)]
@@ -535,14 +595,14 @@ def fetch_content(profile, options, log, check_cancel):
             return {"url": u, "success": False, "error": str(exc), "fetched_at": utc_now(), "extraction_key": extraction_key}
 
     output = {u: fresh[u] for u in selected if u in fresh}
+    progress_update(log, len(output), len(selected), f"Reading content from {len(selected):,} blog and core pages.")
     with ThreadPoolExecutor(max_workers=int(options.get("fetch_workers", 3))) as executor:
         futures = {executor.submit(fetch_one, u): u for u in pending}
         for i, future in enumerate(as_completed(futures), 1):
             check_cancel()
             row = future.result()
             output[row["url"]] = row
-            if i % 20 == 0:
-                log(f"Fetched {i:,}/{len(pending):,} pages; reused {len(selected) - len(pending):,} cached pages.")
+            progress_update(log, len(output), len(selected), f"Read content from {len(output):,}/{len(selected):,} pages.")
     save_dataset(profile, "content", list(output.values()), scope="all eligible" if options.get("all_content") else "blogs + approved core pages",
                  eligible=len(eligible), selected=len(selected), partial=len(eligible) > cap,
                  failed=sum(not r.get("success") for r in output.values()), extraction_key=extraction_key)
@@ -567,7 +627,10 @@ def discover_sitemaps(profile, options, log, check_cancel):
     while queue and len(seen) < cap:
         check_cancel()
         u = url_key(queue.popleft())
-        if not u or u in seen or not same_site(u, profile):
+        map_host = (urlsplit(u).hostname or "").lower()
+        site_base = (urlsplit(profile["root_url"]).hostname or "").lower().removeprefix("www.")
+        allowed_map = same_site(u, profile) or map_host.endswith("." + site_base)
+        if not u or u in seen or not allowed_map:
             continue
         seen.add(u)
         try:
@@ -580,6 +643,8 @@ def discover_sitemaps(profile, options, log, check_cancel):
                 if len(raw) > 20_000_000:
                     raise ValueError("Decompressed sitemap is too large.")
             tree = etree.fromstring(raw, parser=etree.XMLParser(resolve_entities=False, no_network=True))
+            if etree.QName(tree).localname not in {"sitemapindex", "urlset"}:
+                raise ValueError("This URL returned a page rather than an XML sitemap.")
             locations = [str(x).strip() for x in tree.xpath("//*[local-name()='loc']/text()")]
             if etree.QName(tree).localname == "sitemapindex":
                 queue.extend(locations)
@@ -595,26 +660,291 @@ def discover_sitemaps(profile, options, log, check_cancel):
     log(f"Discovered {len(found):,} URLs from {len(seen):,} sitemap requests.")
 
 
-def google_service(interactive=False, secret_path=""):
+CORE_SKIP = re.compile(r"^/(?:about(?:-us)?|our-company|our-team|company|contact(?:-us|-sales)?|support|help(?:-center)?|faq|faqs|careers?|jobs?|work-for-us|team|privacy(?:-policy)?|terms(?:-of-service)?|legal|cookies?(?:-policy)?|login|logout|sign-in|sign-up|signup|account|cart|checkout|search|tag|tags|authors?|categories|blog(?:-category|-categories)?|blogs|articles|insights|news|resources|case-studies|customer-stories|testimonials|webinars|docs|documentation|developers|api-status|sitemap|accessibility|request(?:-a)?-demo|book-a-demo)(?:/|$)", re.I)
+BINARY_PATH = re.compile(r"\.(?:jpe?g|png|webp|gif|svg|ico|css|js|map|pdf|zip|gz|xml|mp4|mov|mp3|woff2?|ttf|eot|xlsx?|docx?|csv)(?:$|\?)", re.I)
+
+
+def page_from_html(raw, url, profile, headers=None):
+    """One parse supplies article detection, crawl edges and source text."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(raw, "lxml")
+    headers = headers or {}
+    extracted = extract_content(raw, url, profile.get("main_selector", ""))
+    noindex = extracted.get("noindex", False) or bool(re.search(r"\bnoindex\b", headers.get("x-robots-tag", ""), re.I))
+    canonical = extracted.get("canonical") or url
+    page = {"url": url, "status": 200, "html": True, "content_type": "text/html", "title": extracted.get("title", ""),
+            "h1": extracted.get("h1", ""), "canonical": canonical, "redirect": "", "source_nofollow": False,
+            "indexable": not noindex and canonical == url, "indexability_status": "noindex" if noindex else "Canonicalised" if canonical != url else ""}
+    robots = " ".join(t.get("content", "") for t in soup.find_all("meta", attrs={"name": re.compile(r"^(robots|googlebot)$", re.I)}))
+    page["source_nofollow"] = bool(re.search(r"\bnofollow\b", robots + " " + headers.get("x-robots-tag", ""), re.I))
+    ogtype = soup.find("meta", attrs={"property": "og:type"})
+    schema_text = " ".join(t.get_text() for t in soup.find_all("script", attrs={"type": "application/ld+json"}))
+    article = (bool(ogtype and ogtype.get("content", "").lower() == "article") or bool(re.search(r'"(?:BlogPosting|NewsArticle|Article)"', schema_text)))
+    page["article"] = article or is_blog(url, profile)
+    edges = []
+    for anchor in soup.find_all("a", href=True):
+        destination = url_key(urljoin(url, anchor["href"]))
+        if not same_site(destination, profile):
+            continue
+        position = "Content"
+        for parent in [anchor, *list(anchor.parents)]:
+            classes = " ".join(parent.get("class", [])) if hasattr(parent, "get") else ""
+            role = parent.get("role", "") if hasattr(parent, "get") else ""
+            if parent.name == "footer" or role == "contentinfo" or re.search(r"(?:^|[-_ ])footer(?:$|[-_ ])", classes, re.I):
+                position = "Footer"
+                break
+            if parent.name in {"nav", "header"} or role == "navigation" or re.search(r"(?:^|[-_ ])(?:nav|navbar|navigation|menu|header)(?:$|[-_ ])", classes, re.I):
+                position = "Navigation"
+                break
+        image = anchor.find("img")
+        edges.append({"source": url, "destination": destination, "anchor": text_norm(anchor.get_text(" ", strip=True)),
+                      "alt": image.get("alt", "") if image else "", "position": position, "position_known": True,
+                      "contextual": position == "Content", "type": "Hyperlink", "locator": "",
+                      "followable": "nofollow" not in anchor.get("rel", []) and not page["source_nofollow"]})
+    org_names = []
+    site_name = soup.find("meta", attrs={"property": "og:site_name"})
+    if site_name and 1 <= len(text_norm(site_name.get("content", "")).split()) <= 5:
+        org_names.append(text_norm(site_name["content"]))
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            stack = [json.loads(script.get_text())]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, list):
+                    stack.extend(value)
+                elif isinstance(value, dict):
+                    kinds = value.get("@type", [])
+                    if isinstance(kinds, str):
+                        kinds = [kinds]
+                    if set(kinds) & {"Organization", "Corporation"} and value.get("name"):
+                        org_names.append(text_norm(value["name"]))
+                    stack.extend(v for v in value.values() if isinstance(v, (dict, list)))
+        except (ValueError, TypeError):
+            continue
+    extracted.update(url=url, final_url=url, status=200, fetched_at=utc_now(), noindex=noindex,
+                     extraction_key=digest({"selector": profile.get("main_selector", ""), "version": APP_VERSION}))
+    return page, edges, extracted, org_names
+
+
+def automatic_brand_terms(profile, names=()):
+    host = (urlsplit(profile["root_url"]).hostname or "").removeprefix("www.")
+    first_label = host.split(".")[0]
+    terms = list(profile.get("brand_terms", [])) + [first_label]
+    clean_name = text_norm(profile.get("name", ""))
+    if clean_name and "." not in clean_name and "synthetic" not in clean_name:
+        terms.append(clean_name)
+    terms.extend(n for n in names if 1 <= len(n.split()) <= 6 and n.lower() not in {"home", "website", "blog", "organization"})
+    profile["brand_terms"] = sorted({text_norm(t).lower() for t in terms if len(text_norm(t)) >= 2})
+    profile["automatic_setup"] = True
+
+
+def detect_proprietary_product_brands(profile, rows):
+    """Only add product names when the page explicitly identifies an own source."""
+    terms = []
+    for row in rows:
+        source = re.search(r"\bSource\s+(.{0,90}?)\bproprietary\b", row.get("text", ""), re.I)
+        name = text_norm(row.get("h1", "")).strip("®™ ")
+        if source and brand_pattern(profile).search(source.group(1)) and len(name) > 4 and (re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][A-Za-z]+)+", name) or re.fullmatch(r"[A-Z][A-Z0-9]+", name)):
+            terms.extend([name, re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)])
+    if terms:
+        automatic_brand_terms(profile, terms)
+
+
+def infer_core_pages(profile, pages, links, strict=True):
+    page_map = {p["url"]: p for p in pages}
+    aliases = aliases_for(pages, profile)
+    candidates = {}
+    for link in links:
+        position = link.get("position", "").lower()
+        if not any(term in position for term in ["nav", "header", "footer"]):
+            continue
+        u = resolve_alias(link["destination"], aliases)
+        if not u or not same_site(u, profile) or is_home(u, profile) or is_blog(u, profile) or excluded(u, profile) or CORE_SKIP.search(urlsplit(u).path) or BINARY_PATH.search(u):
+            continue
+        p = page_map.get(u)
+        if strict and (not p or not p.get("indexable") or p.get("status") != 200 or not p.get("html")):
+            continue
+        topic = without_brand(p.get("h1") or p.get("title") or link.get("anchor") or urlsplit(u).path.replace("-", " "), profile) if p else without_brand(link.get("anchor") or urlsplit(u).path.replace("-", " "), profile)
+        priority = 5 if any(term in position for term in ["nav", "header"]) else 3
+        if u not in candidates or candidates[u]["priority"] < priority:
+            candidates[u] = {"url": u, "topic": topic, "priority": priority, "detected_from": "Navigation" if priority == 5 else "Footer"}
+    if not candidates and pages:
+        # Some themes render menus without semantic nav/footer landmarks.
+        # Repeated destinations are a fallback, explicitly labeled as inferred.
+        repeated = defaultdict(set)
+        for link in links:
+            repeated[resolve_alias(link["destination"], aliases)].add(link["source"])
+        minimum = max(2, math.ceil(len(pages) * .2))
+        for u, sources in repeated.items():
+            p = page_map.get(u, {})
+            if len(sources) >= minimum and p.get("indexable") and p.get("status") == 200 and same_site(u, profile) and not is_home(u, profile) and not is_blog(u, profile) and not excluded(u, profile) and not CORE_SKIP.search(urlsplit(u).path):
+                candidates[u] = {"url": u, "topic": without_brand(p.get("h1") or p.get("title") or urlsplit(u).path, profile), "priority": 3, "detected_from": "Repeated site link (inferred)"}
+    # Preserve intentionally supplied destinations from earlier versions.
+    for core in profile.get("core_pages", []):
+        u = resolve_alias(core["url"], aliases)
+        p = page_map.get(u)
+        if same_site(u, profile) and not is_home(u, profile) and (not strict or (p and p.get("indexable") and p.get("status") == 200)) and not CORE_SKIP.search(urlsplit(u).path):
+            candidates.setdefault(u, {**core, "url": u, "detected_from": core.get("detected_from", "Saved priority page")})
+    profile["core_pages"] = sorted(candidates.values(), key=lambda c: (-c["priority"], c["url"]))
+    return profile["core_pages"]
+
+
+def built_in_crawl(profile, options, log, check_cancel, homepage=None):
+    """Bounded HTML crawl for hosted Streamlit; robots rules are respected."""
+    limit = int(options.get("crawl_limit", 2000))
+    queue, scheduled = [], set()
+    queue_priority, in_flight = {}, set()
+    pages, links, content, article_urls = {}, [], {}, set()
+    import heapq
+    robot_cache, rate_lock, last_request = {}, threading.Lock(), [0.0]
+    counters = Counter()
+
+    def enqueue(u, priority=3):
+        u = url_key(u)
+        if u and same_site(u, profile) and u not in pages and u not in in_flight and not BINARY_PATH.search(u) and not excluded(u, profile):
+            # Tracking params are removed by url_key; avoid faceted URL explosions.
+            params = parse_qsl(urlsplit(u).query)
+            if params and not all((k in {"page", "paged", "p", "offset"} or k.endswith("_page")) and v.isdigit() and 0 < int(v) <= 10000 for k, v in params):
+                return
+            if u in queue_priority and priority >= queue_priority[u]:
+                return
+            scheduled.add(u)
+            queue_priority[u] = priority
+            heapq.heappush(queue, (priority, u))
+
+    def robots_for(u):
+        origin = urlunsplit((*urlsplit(u)[:2], "", "", ""))
+        if origin not in robot_cache:
+            parser = RobotFileParser(origin + "/robots.txt")
+            try:
+                code, _, _, body = get_bytes(origin + "/robots.txt", 1_000_000)
+                parser.parse(body.decode("utf-8", errors="replace").splitlines() if code == 200 else ["User-agent: *", "Disallow:" if code in {404, 410} else "Disallow: /"])
+            except Exception:
+                parser.parse(["User-agent: *", "Disallow: /"])
+            robot_cache[origin] = parser
+        return robot_cache[origin]
+
+    def fetch(u, parser):
+        check_cancel()
+        if not parser.can_fetch(UA, u):
+            return u, None, "Blocked by robots.txt (or robots.txt unavailable)."
+        delay = max(.35, float(parser.crawl_delay(UA) or parser.crawl_delay("*") or 0))
+        with rate_lock:
+            while time.monotonic() < last_request[0] + delay:
+                check_cancel()
+                time.sleep(.1)
+            last_request[0] = time.monotonic()
+        try:
+            return u, get_bytes(u), ""
+        except Exception as exc:
+            return u, None, str(exc)
+
+    def consume(u, response, error=""):
+        check_cancel()
+        counters["checked"] += 1
+        if error or response is None:
+            pages[u] = {"url": u, "status": 0, "html": False, "indexable": False, "indexability_status": error, "title": "", "h1": "", "canonical": "", "redirect": ""}
+            counters["failed"] += 1
+            return
+        status, headers, final, raw = response
+        final = url_key(final)
+        if not same_site(final, profile):
+            counters["failed"] += 1
+            return
+        if u != final:
+            pages[u] = {"url": u, "status": int(headers.get("__redirect_status__") or 0), "html": True, "indexable": False, "indexability_status": "Redirected (chain not recorded)", "title": "", "h1": "", "canonical": "", "redirect": final}
+        if status != 200 or "html" not in headers.get("content-type", "").lower():
+            if status >= 400:
+                counters["failed"] += 1
+            pages[final] = {"url": final, "status": status, "html": "html" in headers.get("content-type", ""), "indexable": False, "indexability_status": f"HTTP {status}", "title": "", "h1": "", "canonical": "", "redirect": ""}
+            return
+        page, edges, body, _ = page_from_html(raw, final, profile, headers)
+        pages[final] = page
+        canonical = page.get("canonical", "")
+        if canonical and canonical != final and same_site(canonical, profile):
+            enqueue(canonical, 0)
+        links.extend(edges)
+        content[final] = body
+        if page.get("article"):
+            article_urls.add(final)
+        for edge in edges:
+            if edge.get("followable"):
+                d = edge["destination"]
+                structural = edge["position"] in {"Navigation", "Footer"}
+                blog_section = bool(re.search(profile.get("blog_pattern", r"/blog/"), urlsplit(d).path.rstrip("/") + "/", re.I))
+                enqueue(d, 1 if structural and not CORE_SKIP.search(urlsplit(d).path) else 2 if is_blog(d, profile) or blog_section else 4)
+
+    if homepage:
+        consume(profile["root_url"], homepage)
+        scheduled.add(profile["root_url"])
+    else:
+        enqueue(profile["root_url"], 0)
+    for c in profile.get("core_pages", []):
+        enqueue(c["url"], 0)
+    try:
+        discover_sitemaps(profile, {"sitemap_cap": 40}, log, check_cancel)
+    except Exception as exc:
+        log(f"Sitemap discovery unavailable; continuing through site links: {exc}")
+    for r in dataset(profile, "sitemaps")["rows"]:
+        enqueue(r["url"], 2 if is_blog(r["url"], profile) else 4)
+    for r in dataset(profile, "gsc_total_pages")["rows"]:
+        enqueue(r["page"], 2 if is_blog(r["page"], profile) else 4)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        while queue or futures:
+            check_cancel()
+            while queue and len(futures) < 3 and counters["checked"] + len(futures) < limit:
+                priority, u = heapq.heappop(queue)
+                if u in pages or u in in_flight or priority != queue_priority.get(u):
+                    continue
+                parser = robots_for(u)
+                in_flight.add(u)
+                futures[executor.submit(fetch, u, parser)] = u
+            if not futures:
+                break
+            finished, _ = wait(list(futures), timeout=1, return_when=FIRST_COMPLETED)
+            for future in finished:
+                in_flight.discard(futures.pop(future))
+                u, response, error = future.result()
+                consume(u, response, error)
+                progress_update(log, counters["checked"], min(limit, len(scheduled)), f"Crawled {counters['checked']:,} pages · {len(queue) + len(futures):,} queued · {len(article_urls):,} blog pages found")
+    profile["blog_urls"] = sorted(article_urls)
+    generation = uuid.uuid4().hex
+    remaining = {u for _, u in queue if u not in pages}
+    partial = bool(remaining)
+    metadata = dict(source="Built-in HTML crawl", generation=generation, partial=partial, crawl_limit=limit,
+                    checked=counters["checked"], failed=counters["failed"], remaining=len(remaining), root=profile["root_url"])
+    save_dataset(profile, "pages", list(pages.values()), **metadata)
+    save_dataset(profile, "links", links, links_verified=True, position_available=True, warnings=[], **metadata)
+    save_dataset(profile, "content", list(content.values()), **metadata)
+    if partial:
+        log(f"Crawl stopped at {limit:,} pages. {len(remaining):,} URLs remain; coverage is marked partial.")
+    if not content:
+        raise ValueError("The site returned no usable HTML. It may block automated access or require JavaScript. You can use Screaming Frog exports under Connection & crawl options.")
+    return counters
+
+
+def google_service(interactive=False, secret_path="", credentials_info=None, client_config=None):
+    """Credentials stay in memory. Workers receive them through a stdin pipe."""
+    global GOOGLE_CREDENTIALS_INFO
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
-    token_path = DATA_DIR / "auth" / "gsc_token.json"
     credentials = None
-    if token_path.exists():
-        credentials = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    info = credentials_info or GOOGLE_CREDENTIALS_INFO
+    if info:
+        credentials = Credentials.from_authorized_user_info(info, SCOPES)
         if not credentials.valid and credentials.refresh_token:
             credentials.refresh(Request())
     if not credentials or not credentials.valid:
         if not interactive:
-            raise ValueError("Connect Google in Clients & settings first. In hosted mode, use an authorized GSC token JSON or Streamlit Secrets.")
-        secret = Path(secret_path).expanduser() if secret_path else DATA_DIR / "auth" / "oauth_client.json"
-        if not secret.is_file():
-            raise FileNotFoundError("Choose a Google OAuth Desktop app client JSON file first.")
-        flow = InstalledAppFlow.from_client_secrets_file(str(secret), SCOPES)
+            raise ValueError("Connect Google under Connection & crawl options, or configure gsc_token_json in Streamlit Secrets.")
+        if not client_config:
+            raise ValueError("Provide a Desktop OAuth client configuration for local sign-in.")
+        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
         credentials = flow.run_local_server(host="localhost", port=0, open_browser=True, timeout_seconds=180)
-    atomic_json(token_path, json.loads(credentials.to_json()), private=True)
+    GOOGLE_CREDENTIALS_INFO = json.loads(credentials.to_json())
     return build("searchconsole", "v1", credentials=credentials, cache_discovery=False)
 
 
@@ -724,7 +1054,8 @@ def download_gsc(profile, options, log, check_cancel, service=None):
         queries.extend(chunk)
         if truncated:
             warning.append(f"Query extraction cap reached for {cursor}–{chunk_end}.")
-        log(f"GSC {cursor} to {chunk_end}: {len(chunk):,} query/page rows.")
+        progress_update(log, (chunk_end - start).days + 1, (end - start).days + 1,
+                        f"Search Console: {cursor} to {chunk_end}; {len(chunk):,} query/page rows.")
         cursor = chunk_end + timedelta(days=1)
     pattern = brand_pattern(profile)
     queries = [r for r in queries if same_site(r.get("page", ""), profile) and not pattern.search(text_norm(r.get("query", "")))]
@@ -834,6 +1165,7 @@ def anchor_candidates(paragraph, dest, query_rows, profile):
     if not weights:
         return []
     head_terms = set(meaningful_tokens(headings))
+    intent_terms = head_terms - set("data api financial market real time real-time realtime historical complete comprehensive guide access technology platform business innovative modern build best high quality global industry leading".split())
     seeds = [q["query"] for q in query_rows[:35] if 2 <= len(q["query"].split()) <= 8]
     for heading in [dest.get("topic", ""), dest.get("h1", ""), dest.get("title", "")]:
         heading = without_brand(heading, profile)
@@ -849,6 +1181,8 @@ def anchor_candidates(paragraph, dest, query_rows, profile):
                 spans.append((tokens[i].start(), tokens[i + n - 1].end(), False))
         for start, end, seeded in spans:
             anchor = segment[start:end]
+            if re.search(r"[,;:!?()\[\]{}]", anchor):
+                continue
             words = [m.group().lower() for m in TOKEN_RE.finditer(anchor)]
             terms = meaningful_tokens(anchor)
             if not 2 <= len(words) <= 8 or len(anchor) > 100 or not terms or words[0] in BAD_EDGE or words[-1] in BAD_EDGE:
@@ -856,6 +1190,8 @@ def anchor_candidates(paragraph, dest, query_rows, profile):
             if pattern.search(anchor) or text_norm(anchor).lower() in GENERIC_ANCHORS:
                 continue
             overlap = set(terms) & set(weights)
+            if intent_terms and not (set(terms) & intent_terms):
+                continue
             precision = len(overlap) / len(set(terms))
             if len(overlap) < 2 or precision < .75 or not (overlap & head_terms):
                 continue
@@ -886,17 +1222,27 @@ def rank_paragraphs(documents, paragraphs, mode, allow_download=False, check_can
             vectors.append(np.vstack(blocks))
         return vectors[0], vectors[1], "semantic"
     from sklearn.feature_extraction.text import TfidfVectorizer
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), sublinear_tf=True, max_features=50000, dtype=np.float32)
+    vectorizer = TfidfVectorizer(tokenizer=meaningful_tokens, token_pattern=None, ngram_range=(1, 2), sublinear_tf=True, max_features=50000, dtype=np.float32)
     matrix = vectorizer.fit_transform(documents + paragraphs)
     return matrix[:len(documents)], matrix[len(documents):], "lexical"
 
 
 REC_INPUTS = ["pages", "links", "content", "gsc_pages", "gsc_queries"]
 AUDIT_INPUTS = ["pages", "links", "sitemaps", "gsc_pages", "gsc_total_pages"]
+VAGUE_TOPIC_WORDS = set("data api financial market real time real-time realtime historical delayed delay minute minutes min complete comprehensive guide access technology platform business innovative modern build best high quality global industry leading software total basic bring package packages".split())
+
+
+def distinctive_topic_terms(dest, profile):
+    identity = without_brand(dest.get("topic", "") + " " + dest.get("h1", ""), profile)
+    terms = {t for t in meaningful_tokens(identity) if t not in VAGUE_TOPIC_WORDS and not any(c.isdigit() for c in t)}
+    if not terms:
+        identity = without_brand(urlsplit(dest["url"]).path.replace("-", " ").replace("/", " "), profile)
+        terms = {t for t in meaningful_tokens(identity) if t not in VAGUE_TOPIC_WORDS and not any(c.isdigit() for c in t)}
+    return terms
 
 
 def recommend(profile, options, log, check_cancel):
-    if not profile.get("brands_confirmed") or not profile.get("brand_terms"):
+    if (not profile.get("brands_confirmed") and not options.get("automatic_setup")) or not profile.get("brand_terms"):
         raise ValueError("Review and confirm this client's brand exclusions before generating recommendations.")
     state = graph_state(profile)
     pages, aliases = state["pages"], state["aliases"]
@@ -912,6 +1258,15 @@ def recommend(profile, options, log, check_cancel):
                 and (not content[u].get("canonical") or content[u]["canonical"] == u)}
     sources = [u for u in eligible if (is_blog(u, profile) or options.get("all_sources")) and not is_home(u, profile)]
     targets = [u for u in eligible if not is_home(u, profile) and (resolve_alias(u, aliases) in core or (options.get("blog_to_blog") and is_blog(u, profile)))]
+    if options.get("destination_url"):
+        selected_target = resolve_alias(options["destination_url"], aliases)
+        targets = [u for u in targets if resolve_alias(u, aliases) == selected_target]
+    requested_anchor = text_norm(options.get("anchor_text", ""))
+    if requested_anchor:
+        if brand_pattern(profile).search(requested_anchor):
+            raise ValueError("The anchor contains this client's brand name. Enter a descriptive non-brand phrase.")
+        if requested_anchor.casefold() in GENERIC_ANCHORS or len(requested_anchor) > 120:
+            raise ValueError("Enter a short descriptive anchor, such as 'options data API'.")
     # Destinations are prioritized before paragraph retrieval; this cap is explicit in the UI.
     targets.sort(key=lambda u: (core.get(resolve_alias(u, aliases), {}).get("priority", 1), metrics.get(u, {}).get("impressions", 0)), reverse=True)
     target_total = len(targets)
@@ -932,10 +1287,17 @@ def recommend(profile, options, log, check_cancel):
         dest = {"url": u, "title": content[u].get("title", pages[u].get("title", "")), "h1": content[u].get("h1", pages[u].get("h1", "")), "topic": c.get("topic", "")}
         dests.append(dest)
         # Keep target representations focused. Broad body copy must not drown out intent.
-        doc = " ".join([dest["topic"]] * 3 + [dest["title"], dest["h1"]] * 2 + [" ".join(q["query"] for q in queries.get(u, [])[:20]), " ".join(content[u].get("text", "").split()[:400])])
+        doc = " ".join([dest["topic"]] * 3 + [dest["title"], dest["h1"]] * 2 + [" ".join(q["query"] for q in queries.get(u, [])[:20]), " ".join(content[u].get("text", "").split()[:100])])
         documents.append(without_brand(doc, profile))
     mode = options.get("matching_mode", "lexical")
-    threshold = float(options.get("semantic_threshold", .45) if mode == "semantic" else options.get("lexical_threshold", .14))
+    topic_frequency = Counter(t for d in dests for t in distinctive_topic_terms(d, profile))
+    for dest in dests:
+        terms = distinctive_topic_terms(dest, profile)
+        least_common = min((topic_frequency[t] for t in terms), default=0)
+        dest["signature_terms"] = {t for t in terms if topic_frequency[t] == least_common}
+    threshold = float(options.get("semantic_threshold", .45) if mode == "semantic" else options.get("lexical_threshold", .10))
+    if requested_anchor and options.get("destination_url"):
+        threshold = 0
     log(f"Matching {len(paragraphs):,} existing paragraphs against {len(targets):,} destinations ({mode}).")
     dest_vectors, para_vectors, _ = rank_paragraphs(documents, [without_brand(p["text"], profile) for p in paragraphs], mode, options.get("allow_model_download", False), check_cancel)
     max_rank = max(state["rank"].values(), default=1)
@@ -966,11 +1328,27 @@ def recommend(profile, options, log, check_cancel):
             examined += 1
             paragraph = paragraphs[int(para_idx)]
             source = paragraph["url"]
+            # Prevent generic overlap (e.g. delayed stock data -> options feed)
+            # from overpowering the destination's distinctive topic.
+            if not options.get("destination_url") and dest["signature_terms"] and not (set(meaningful_tokens(paragraph["text"])) & dest["signature_terms"]):
+                continue
             pair = (resolve_alias(source, aliases), resolve_alias(target, aliases))
             existing_body = {resolve_alias(u, aliases) for u in content[source].get("outgoing_content", [])}
             if source == target or pair in state["blocked_pairs"] or pair[1] in existing_body or source in per_source:
                 continue
-            anchors = anchor_candidates(paragraph, dest, qrows, profile)
+            if requested_anchor:
+                anchors = []
+                for segment in paragraph.get("unlinked", []):
+                    match = phrase_pattern(requested_anchor).search(segment)
+                    if match:
+                        anchors.append({"anchor": match.group(), "anchor_score": .85, "segment": segment, "start": match.start(), "end": match.end()})
+                # Explicitly entered anchors still need a destination that describes them.
+                anchor_terms = set(meaningful_tokens(requested_anchor))
+                target_terms = set(meaningful_tokens(" ".join([dest['topic'], dest['h1'], dest['title']])))
+                if not options.get("destination_url") and (not anchor_terms or not (anchor_terms & target_terms)):
+                    anchors = []
+            else:
+                anchors = anchor_candidates(paragraph, dest, qrows, profile)
             if not anchors:
                 continue
             a = anchors[0]
@@ -1001,8 +1379,7 @@ def recommend(profile, options, log, check_cancel):
                    "existing_other_link": pair in state["all_pairs"], "status": review.get("status", "Proposed"), "notes": review.get("notes", "")}
             rows.append(row)
             candidates_by_slot[(source, paragraph["locator"], a["anchor"].casefold())].append(row)
-        if (idx + 1) % 20 == 0:
-            log(f"Checked {idx + 1:,}/{len(targets):,} destinations.")
+        progress_update(log, idx + 1, len(targets), f"Matched blog paragraphs against {idx + 1:,}/{len(targets):,} core pages.")
     ambiguous_ids = set()
     for group in candidates_by_slot.values():
         group.sort(key=lambda r: r["paragraph_similarity"], reverse=True)
@@ -1342,7 +1719,7 @@ def release_job_lock(job_id):
         lock.unlink(missing_ok=True)
 
 
-def create_job(profiles, stages, options):
+def create_job(profiles, stages, options, credentials_info=None, workflow="legacy"):
     import psutil
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
@@ -1350,14 +1727,19 @@ def create_job(profiles, stages, options):
     folder = DATA_DIR / "jobs" / job_id
     folder.mkdir(parents=True)
     job_path = folder / "job.json"
-    atomic_json(job_path, {"id": job_id, "profiles": profiles, "stages": stages, "options": options, "data_dir": str(DATA_DIR)})
+    atomic_json(job_path, {"id": job_id, "profiles": profiles, "stages": stages, "options": options, "data_dir": str(DATA_DIR), "workflow": workflow})
     atomic_json(folder / "status.json", {"state": "queued", "created_at": utc_now(), "job_id": job_id, "completed": [], "errors": []})
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     try:
         with (folder / "worker.log").open("w", encoding="utf-8") as log:
             process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--worker", str(job_path)],
-                                       stdout=log, stderr=subprocess.STDOUT, cwd=str(APP_DIR), creationflags=flags,
+                                       stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, cwd=str(APP_DIR), creationflags=flags,
                                        start_new_session=os.name != "nt", shell=False)
+        try:
+            process.stdin.write(json.dumps({"google_credentials": credentials_info}).encode("utf-8"))
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
         try:
             create_time = psutil.Process(process.pid).create_time()
         except psutil.NoSuchProcess:
@@ -1372,10 +1754,14 @@ def create_job(profiles, stages, options):
 
 
 def worker_main(job_path):
-    global DATA_DIR
+    global DATA_DIR, GOOGLE_CREDENTIALS_INFO
     job_path = Path(job_path)
     job = read_json(job_path)
     DATA_DIR = Path(job["data_dir"])
+    try:
+        GOOGLE_CREDENTIALS_INFO = json.loads(sys.stdin.read() or "{}").get("google_credentials")
+    except (ValueError, OSError):
+        GOOGLE_CREDENTIALS_INFO = None
     folder = job_path.parent
     status = read_json(folder / "status.json", {})
     status.update(state="running", started_at=utc_now(), completed=[], errors=[])
@@ -1391,6 +1777,9 @@ def worker_main(job_path):
 
     routines = {"crawl": run_sf, "sitemaps": discover_sitemaps, "gsc": download_gsc, "content": fetch_content, "recommendations": recommend, "audit": audit_links}
     try:
+        if job.get("workflow") == "simple":
+            simple_pipeline(job, status, log, check_cancel, folder)
+            return
         for profile in job["profiles"]:
             validate_profile(profile)
             for stage in STAGES:
@@ -1414,7 +1803,7 @@ def worker_main(job_path):
     except Cancelled:
         status.update(state="cancelled", finished_at=utc_now())
     except BaseException as exc:
-        status["errors"].append({"error": str(exc)})
+        status["errors"].append({"error": safe_error(exc)})
         status.update(state="failed", finished_at=utc_now())
     finally:
         atomic_json(folder / "status.json", status)
@@ -1482,6 +1871,196 @@ def install_demo():
     return p
 
 
+def recent_dataset(profile, name, hours=24):
+    doc = dataset(profile, name)
+    try:
+        stamp = datetime.fromisoformat(doc["meta"]["created_at"])
+        return bool(doc["rows"]) and (datetime.now(timezone.utc) - stamp).total_seconds() < hours * 3600
+    except (KeyError, ValueError):
+        return False
+
+
+def save_working_profile(profile):
+    current = read_json(DATA_DIR / "profiles.json", [])
+    found = False
+    for i, row in enumerate(current):
+        if row["id"] == profile["id"]:
+            current[i] = profile
+            found = True
+            break
+    if not found:
+        current.append(profile)
+    atomic_json(DATA_DIR / "profiles.json", current)
+
+
+def safe_error(exc):
+    if type(exc).__name__ in {"RefreshError", "OAuthError", "TokenExpiredError"}:
+        return "Google authorization expired or was revoked. Reconnect Google in Connection & crawl options."
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status:
+        return f"Google returned HTTP {status}. Check account access, API enablement or quota, then reconnect if needed."
+    value = str(exc)
+    value = re.sub(r'(?i)(access_token|refresh_token|client_secret|authorization)([\s\"\':=]+)[^\s,}\"]+', r'\1\2[redacted]', value)
+    return value[:1000]
+
+
+def simple_pipeline(job, status, log, check_cancel, folder):
+    """The one-click workflow; no credentials are written to any dataset."""
+    profile = dict(job["profiles"][0])
+    options = dict(job["options"])
+    options.update(automatic_setup=True, all_sources=False, blog_to_blog=False,
+                   audit_checks=list(AUDITS), recommendation_cap=300,
+                   links_per_target=30 if options.get("anchor_text") else 5,
+                   paragraphs_per_target=500 if options.get("anchor_text") else 120,
+                   content_cap=options.get("crawl_limit", 2000))
+    phases = ["Discover pages & navigation", "Crawl blogs & core pages", "Load search performance", "Find contextual links", "Analyze internal links", "Prepare charts & workbook"]
+    weights = [.05, .50, .10, .20, .05, .10]
+    warnings = []
+    status.update(client=profile["name"], warnings=warnings, phase_count=len(phases), phase_index=0, overall_progress=0, phase_progress=0)
+
+    def publish():
+        status["updated_at"] = utc_now()
+        atomic_json(folder / "status.json", status)
+
+    def phase(index):
+        check_cancel()
+        status.update(phase_index=index, stage=phases[index], phase_progress=0, overall_progress=sum(weights[:index]), done=0, total=0)
+        log(phases[index])
+        publish()
+
+    def progress(done, total, message):
+        check_cancel()
+        fraction = min(.99, done / total) if total else 0
+        status.update(done=done, total=total, phase_progress=fraction, message=message,
+                      overall_progress=min(.99, sum(weights[:status["phase_index"]]) + weights[status["phase_index"]] * fraction))
+        publish()
+    log.progress = progress
+    phase(0)
+    automatic_brand_terms(profile)
+    old_pages, old_links = dataset(profile, "pages"), dataset(profile, "links")
+    cached = (profile.get("demo") or (not options.get("refresh_crawl") and recent_dataset(profile, "pages") and old_links["meta"].get("links_verified") and old_pages["meta"].get("generation") == old_links["meta"].get("generation")))
+    homepage = None
+    if cached:
+        infer_core_pages(profile, dataset(profile, "pages")["rows"], dataset(profile, "links")["rows"])
+        progress(1, 1, "Using the saved crawl; reading navigation and footer links.")
+    else:
+        try:
+            # Respect root robots directives before downloading the homepage.
+            origin = urlunsplit((*urlsplit(profile["root_url"])[:2], "", "", ""))
+            robot = RobotFileParser(origin + "/robots.txt")
+            code, _, _, raw_robot = get_bytes(origin + "/robots.txt", 1_000_000)
+            robot.parse(raw_robot.decode("utf-8", errors="replace").splitlines() if code == 200 else ["User-agent: *", "Disallow:" if code in {404, 410} else "Disallow: /"])
+            if not robot.can_fetch(UA, profile["root_url"]):
+                raise ValueError("Homepage access is blocked by robots.txt or robots.txt is unavailable.")
+            homepage = get_bytes(profile["root_url"])
+            code, headers, final_url, raw = homepage
+            if code != 200 or not same_site(final_url, profile):
+                raise ValueError(f"Homepage returned HTTP {code} or redirected outside the configured website.")
+            profile["root_url"] = url_key(final_url)
+            page, edges, _, names = page_from_html(raw, profile["root_url"], profile, headers)
+            automatic_brand_terms(profile, names)
+            infer_core_pages(profile, [page], edges, strict=False)
+            progress(1, 1, f"Detected {len(profile['core_pages'])} candidate core pages from navigation and footer.")
+        except Exception as exc:
+            if options.get("runtime_mode") != "local":
+                raise ValueError(f"Could not read the website: {safe_error(exc)}") from exc
+            warnings.append("Homepage HTML could not be read; using the local Screaming Frog crawl to identify navigation links.")
+    if not profile.get("demo") and GOOGLE_CREDENTIALS_INFO and profile.get("gsc_property") and not recent_dataset(profile, "gsc_total_pages"):
+        try:
+            log("Loading known landing pages from Search Console for crawl discovery.")
+            end = datetime.now(ZoneInfo("America/Los_Angeles")).date() - timedelta(days=3)
+            start = end - timedelta(days=89)
+            rows, capped = gsc_rows(google_service(), profile["gsc_property"], start, end, ["page"], [], check_cancel)
+            rows = [r for r in rows if same_site(r.get("page", ""), profile)]
+            save_dataset(profile, "gsc_total_pages", aggregate_gsc(rows, ["page"]), start_date=str(start), end_date=str(end),
+                         gsc_property=profile["gsc_property"], source="GSC crawl discovery", partial=capped)
+        except Cancelled:
+            raise
+        except Exception as exc:
+            warnings.append("GSC URL discovery unavailable: " + safe_error(exc))
+    phase(1)
+    if cached:
+        if profile.get("demo") or recent_dataset(profile, "content"):
+            progress(len(dataset(profile, "pages")["rows"]), len(dataset(profile, "pages")["rows"]), "Reusing the saved crawl and extracted content.")
+        else:
+            fetch_content(profile, options, log, check_cancel)
+    else:
+        use_sf = False
+        if options.get("runtime_mode") == "local":
+            try:
+                find_sf(options.get("sf_path", ""))
+                use_sf = True
+            except FileNotFoundError:
+                pass
+        if use_sf:
+            run_sf(profile, options, log, check_cancel)
+            infer_core_pages(profile, dataset(profile, "pages")["rows"], dataset(profile, "links")["rows"])
+            fetch_content(profile, options, log, check_cancel)
+        else:
+            built_in_crawl(profile, options, log, check_cancel, homepage)
+    pages = dataset(profile, "pages")["rows"]
+    infer_core_pages(profile, pages, dataset(profile, "links")["rows"])
+    detect_proprietary_product_brands(profile, dataset(profile, "content")["rows"])
+    if not profile.get("core_pages"):
+        raise ValueError("No eligible core pages were found in the navigation/footer. A JavaScript-rendered menu may need a local Screaming Frog crawl or imported exports.")
+    save_working_profile(profile)
+    status["core_pages"] = len(profile["core_pages"])
+    indexable_urls = {p["url"] for p in pages if p.get("indexable")}
+    status["blogs"] = sum(is_blog(c["url"], profile) for c in dataset(profile, "content")["rows"] if c.get("success") and c["url"] in indexable_urls)
+    phase(2)
+    if profile.get("demo"):
+        progress(1, 1, "Using synthetic demo metrics.")
+    elif GOOGLE_CREDENTIALS_INFO and profile.get("gsc_property"):
+        gsc_meta = dataset(profile, "gsc_pages")["meta"]
+        if recent_dataset(profile, "gsc_pages") and not options.get("refresh_crawl") and gsc_meta.get("brand_rules_hash") == digest(profile.get("brand_terms", [])):
+            progress(1, 1, "Using saved Search Console metrics.")
+        else:
+            try:
+                end = datetime.now(ZoneInfo("America/Los_Angeles")).date() - timedelta(days=3)
+                download_gsc(profile, {**options, "start_date": str(end - timedelta(days=89)), "end_date": str(end), "brand_mode": "auto"}, log, check_cancel)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                warnings.append("Search Console unavailable for this run: " + safe_error(exc) + " Content matching will continue.")
+    else:
+        progress(1, 1, "Search Console is optional; matching will use page content and existing links.")
+        if not dataset(profile, "gsc_pages")["rows"]:
+            warnings.append("No GSC metrics are connected. Opportunities use content relevance and internal links; impressions/positions are left blank.")
+    phase(3)
+    recommend(profile, options, log, check_cancel)
+    phase(4)
+    audit_links(profile, options, log, check_cancel)
+    phase(5)
+    visual_rows = []
+    kinds = ["Opportunity chart", "Topic graph", "Crawl tree"]
+    for i, kind in enumerate(kinds, 1):
+        check_cancel()
+        try:
+            figure, rows, note = make_visual(profile, {"visual_type": kind, "show_proposed": True, "node_cap": 120})
+            visual_rows.append({"kind": kind, "figure_json": figure.to_json(), "note": note})
+        except ValueError as exc:
+            if kind != "Opportunity chart":
+                warnings.append(safe_error(exc))
+        progress(i, 4, f"Prepared {kind.lower()}.")
+    save_dataset(profile, "visuals", visual_rows)
+    workbook = workbook_bytes([profile], ["Recommendations", "Existing-link issues", "Page summary", "Run summary"])
+    output = client_dir(profile) / "exports" / f"internal_links_{job['id']}.xlsx"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(workbook)
+    for name in ["pages", "recommendations"]:
+        if dataset(profile, name)["meta"].get("partial"):
+            warnings.append("This run covers a limited selection of pages. Coverage and limits are included in the workbook.")
+    failures = dataset(profile, "pages")["meta"].get("failed", 0)
+    if failures:
+        warnings.append(f"{failures} page requests failed or were blocked. Results cover pages that could be read.")
+    save_dataset(profile, "result", [], workbook=str(output), warnings=list(dict.fromkeys(warnings)), job_id=job["id"],
+                 core_pages=status["core_pages"], blogs=status["blogs"], anchor_text=options.get("anchor_text", ""),
+                 opportunities=len(dataset(profile, "recommendations")["rows"]), crawl_source=dataset(profile, "pages")["meta"].get("source"))
+    status.update(state="completed", overall_progress=1, phase_progress=1, done=4, total=4, warnings=list(dict.fromkeys(warnings)),
+                  finished_at=utc_now(), message="Opportunities, analysis, charts and workbook are ready.")
+    publish()
+
+
 def parse_core_lines(value):
     rows = []
     for line in value.splitlines():
@@ -1506,444 +2085,307 @@ def show_saved_warnings(st, doc):
         st.warning("This saved result covers a capped/partial selection. See Run summary for its scope.")
 
 
-def render_settings(st, profiles, selected):
-    st.title("Clients & settings")
-    settings = read_json(DATA_DIR / "settings.json", {})
-    with st.expander("Deployment & Screaming Frog settings", expanded=not profiles):
-        with st.form("global_settings"):
-            runtime = st.radio("Where is this app running?", ["hosted", "local"], index=0 if settings.get("runtime_mode", "hosted") == "hosted" else 1,
-                               format_func=lambda x: "GitHub / Streamlit Cloud" if x == "hosted" else "Local computer with Screaming Frog installed")
-            st.caption("In hosted mode, import Screaming Frog exports below. Cloud storage can be reset on reboot/redeploy; download workbooks and client settings you want to retain.")
-            sf_path = st.text_input("Screaming Frog CLI executable (blank = auto-detect)", value=settings.get("sf_path", ""), placeholder=r"C:\Program Files\Screaming Frog SEO Spider\ScreamingFrogSEOSpiderCli.exe")
-            timeout = st.number_input("Crawl timeout (minutes)", min_value=5, max_value=1440, value=int(settings.get("crawl_timeout_minutes", 180)))
-            if st.form_submit_button("Save local settings"):
-                settings = {**settings, "runtime_mode": runtime, "sf_path": sf_path.strip(), "crawl_timeout_minutes": int(timeout)}
-                atomic_json(DATA_DIR / "settings.json", settings)
-                st.success("Settings saved. No crawl was started.")
-    with st.expander("Connect Google and discover properties", expanded=not profiles):
-        hosted = settings.get("runtime_mode", "hosted") != "local"
-        st.write("One read-only Google authorization is shared across client profiles. An already-authorized token from your IBML script can access the properties available to that Google account.")
-        token_upload = st.file_uploader("Authorized GSC token JSON (optional if configured in Streamlit Secrets)", type="json", key="token_upload")
-        if hosted:
-            st.write("Use the token file created after Google login, such as gsc_token_ibml.json. An OAuth client-secret JSON alone is not an authorized token.")
-            st.code("app_password = \"choose-a-private-password\"\ngsc_token_json = '''\nPASTE THE COMPLETE AUTHORIZED TOKEN JSON HERE\n'''", language="toml")
-            st.caption("Add these in Streamlit → app Settings → Secrets. Keep credentials out of GitHub. You may instead upload the authorized token above for this running app instance.")
+def register_google_properties(properties):
+    """One preferred property per host; retain existing client identities."""
+    profiles = read_json(DATA_DIR / "profiles.json", [])
+    by_host = {(urlsplit(p["root_url"]).hostname or "").removeprefix("www."): p for p in profiles if not p.get("demo")}
+    grouped = defaultdict(list)
+    for row in properties:
+        prop = row.get("siteUrl", "")
+        if row.get("permissionLevel") == "siteUnverifiedUser":
+            continue
+        root = "https://" + prop.split(":", 1)[1] + "/" if prop.startswith("sc-domain:") else prop
+        host = (urlsplit(root).hostname or "").removeprefix("www.")
+        if host and (prop.startswith("sc-domain:") or urlsplit(root).path in {"", "/"}):
+            grouped[host].append((prop, root))
+    for host, choices in grouped.items():
+        prop, root = sorted(choices, key=lambda x: (not x[0].startswith("sc-domain:"), not x[1].startswith("https://")))[0]
+        if host in by_host:
+            by_host[host]["gsc_property"] = prop
         else:
-            secret = st.file_uploader("Google OAuth Desktop client JSON (for a new local login)", type=["json"], key="oauth_upload")
-            if st.button("Save OAuth client file", disabled=secret is None):
-                try:
-                    value = json.loads(secret.getvalue())
-                    if "installed" not in value:
-                        raise ValueError("Use a Desktop app OAuth client, not a service-account or web-app JSON.")
-                    atomic_json(DATA_DIR / "auth" / "oauth_client.json", value, private=True)
-                    st.success("OAuth client saved locally.")
-                except Exception as exc:
-                    st.error(str(exc))
-        if st.button("Connect Google / refresh property list"):
-            try:
-                with st.spinner("Connecting to Google…"):
-                    token_info = None
-                    if token_upload is not None:
-                        token_info = json.loads(token_upload.getvalue())
-                    else:
-                        try:
-                            saved = st.secrets.get("gsc_token_json", "")
-                            if saved:
-                                token_info = json.loads(saved) if isinstance(saved, str) else dict(saved)
-                        except FileNotFoundError:
-                            pass
-                    if token_info is not None:
-                        if not all(token_info.get(k) for k in ["refresh_token", "client_id", "client_secret"]):
-                            raise ValueError("This is not a usable authorized token JSON. It must include refresh_token, client_id and client_secret.")
-                        atomic_json(DATA_DIR / "auth" / "gsc_token.json", token_info, private=True)
-                    service = google_service(interactive=not hosted)
-                    properties = execute_google(lambda: service.sites().list()).get("siteEntry", [])
-                    properties = [p for p in properties if p.get("permissionLevel") != "siteUnverifiedUser"]
-                    atomic_json(DATA_DIR / "properties.json", properties)
-                st.success(f"Connected. Found {len(properties)} accessible properties.")
-            except Exception as exc:
-                st.error(str(exc))
-        properties = read_json(DATA_DIR / "properties.json", [])
-        choices = [p["siteUrl"] for p in properties]
-        if choices:
-            picked = st.multiselect("Create client profiles from properties", choices, help="Choose one preferred property per client; domain and prefix properties may overlap.")
-            if st.button("Add selected clients", disabled=not picked):
-                profiles = read_json(DATA_DIR / "profiles.json", [])
-                existing = {(urlsplit(p["root_url"]).hostname or "").removeprefix("www.") for p in profiles}
-                added = 0
-                for prop in picked:
-                    root = "https://" + prop.split(":", 1)[1] + "/" if prop.startswith("sc-domain:") else prop
-                    host = (urlsplit(root).hostname or "").removeprefix("www.")
-                    if host in existing:
-                        continue
-                    profiles.append(default_profile(host, root, prop))
-                    existing.add(host)
-                    added += 1
-                atomic_json(DATA_DIR / "profiles.json", profiles)
-                st.success(f"Added {added} client(s). Existing domains were kept. Review each crawl URL, brand list and core-page list.")
-    with st.expander("Add a client manually"):
-        with st.form("new_client"):
-            name = st.text_input("Client name")
-            root = st.text_input("Website / homepage URL", placeholder="https://www.example.com/")
-            prop = st.text_input("GSC property (optional)", placeholder="sc-domain:example.com")
-            if st.form_submit_button("Create client"):
-                try:
-                    if not name.strip():
-                        raise ValueError("Enter a client name.")
-                    p = default_profile(name.strip(), root.strip(), prop.strip())
-                    validate_profile(p)
-                    current = read_json(DATA_DIR / "profiles.json", [])
-                    current.append(p)
-                    atomic_json(DATA_DIR / "profiles.json", current)
-                    st.success("Client created. Select it from the sidebar to finish setup.")
-                except Exception as exc:
-                    st.error(str(exc))
-    with st.expander("Back up / restore client settings"):
-        st.download_button("Download client settings JSON", json.dumps(profiles, indent=2, ensure_ascii=False), "internal_link_clients.json", "application/json", on_click="ignore", disabled=not profiles)
-        backup = st.file_uploader("Client settings JSON to restore", type="json", key="profile_restore")
-        if st.button("Import / merge client settings", disabled=backup is None):
-            try:
-                loaded = json.loads(backup.getvalue())
-                if not isinstance(loaded, list):
-                    raise ValueError("Expected a list of client profiles.")
-                current = {r["id"]: r for r in read_json(DATA_DIR / "profiles.json", [])}
-                for item in loaded:
-                    validate_profile(item)
-                    if not item.get("id") or slug(item["id"]) != item["id"]:
-                        raise ValueError("Invalid client profile ID.")
-                    current[item["id"]] = item
-                atomic_json(DATA_DIR / "profiles.json", list(current.values()))
-                st.success("Client settings merged. Credentials and crawl datasets are not included in this backup.")
-            except Exception as exc:
-                st.error(str(exc))
-    if selected:
-        p = selected
-        st.subheader(f"Edit {p['name']}")
-        with st.form("edit_profile_" + p["id"]):
-            name = st.text_input("Client name", p["name"])
-            root = st.text_input("Crawl start / homepage URL", p["root_url"])
-            prop = st.text_input("Preferred GSC property", p.get("gsc_property", ""))
-            brand_terms = st.text_area("Brand exclusions — one term per line", "\n".join(p.get("brand_terms", [])), help="Include company names, variants, abbreviations and branded products. Terms use word boundaries.")
-            confirmed = st.checkbox("I have reviewed these brand terms", value=p.get("brands_confirmed", False))
-            core = st.text_area("Approved core pages — URL | topic | priority (1–5)", "\n".join(f"{c['url']} | {c.get('topic', '')} | {c.get('priority', 3)}" for c in p.get("core_pages", [])), height=180,
-                                placeholder="https://www.example.com/services/document-scanning/ | document scanning services | 5")
-            blogs = st.text_input("Blog URL path regex", p.get("blog_pattern", ""))
-            exclusions = st.text_input("Excluded destination paths regex", p.get("exclude_pattern", ""))
-            hosts = st.text_area("Allowed hosts — one per line", "\n".join(p.get("allowed_hosts", [])))
-            selector = st.text_input("Main content CSS selector (optional)", p.get("main_selector", ""), help="Examples: main, article .entry-content. Set this if shared modules appear in recommendations.")
-            sf_config = st.text_input("Saved Screaming Frog configuration path (optional)", p.get("sf_config", ""))
-            sitemap_urls = st.text_area("Sitemap URLs (optional, one per line)", "\n".join(p.get("sitemap_urls", [])))
-            if st.form_submit_button("Save client profile", type="primary"):
-                try:
-                    changed = {**p, "name": name.strip(), "root_url": url_key(root), "gsc_property": prop.strip(),
-                               "brand_terms": [x.strip() for x in brand_terms.splitlines() if x.strip()], "brands_confirmed": confirmed,
-                               "core_pages": parse_core_lines(core), "blog_pattern": blogs.strip(), "exclude_pattern": exclusions.strip(),
-                               "allowed_hosts": [x.strip().lower() for x in hosts.splitlines() if x.strip()], "main_selector": selector.strip(),
-                               "sf_config": sf_config.strip(), "sitemap_urls": [x.strip() for x in sitemap_urls.splitlines() if x.strip()]}
-                    validate_profile(changed)
-                    current = read_json(DATA_DIR / "profiles.json", [])
-                    atomic_json(DATA_DIR / "profiles.json", [changed if c["id"] == p["id"] else c for c in current])
-                    st.success("Client saved. Saved analyses will show as outdated if their inputs changed.")
-                except Exception as exc:
-                    st.error(str(exc))
-        with st.expander("Import an existing Screaming Frog crawl"):
-            st.write("Export Internal:All and Bulk Export → Links → All Inlinks from the same crawl. Include Link Position for contextual analysis. Importing does not crawl or fetch pages.")
-            internal = st.file_uploader("Internal:All CSV", type="csv", key="import_internal_" + p["id"])
-            inlinks = st.file_uploader("All Inlinks CSV", type="csv", key="import_inlinks_" + p["id"])
-            if st.button("Import both CSVs", disabled=internal is None or inlinks is None):
-                try:
-                    counts = save_crawl(p, read_sf_csv(io.BytesIO(internal.getvalue())), read_sf_csv(io.BytesIO(inlinks.getvalue())), "Manual SF CSV import", root=p["root_url"])
-                    st.success(f"Imported {counts[0]:,} pages and {counts[1]:,} hyperlink records.")
-                except Exception as exc:
-                    st.error(str(exc))
+            profile = default_profile(host, root, prop)
+            automatic_brand_terms(profile)
+            profiles.append(profile)
+    atomic_json(DATA_DIR / "profiles.json", profiles)
+    atomic_json(DATA_DIR / "properties.json", properties)
+    return profiles
 
 
-def render_job_monitor(st):
-    @st.fragment(run_every="3s")
-    def monitor():
-        folders = sorted((DATA_DIR / "jobs").glob("*/status.json"), reverse=True)[:5]
-        if not folders:
-            st.caption("No jobs have been started.")
-        for path in folders:
-            status = read_json(path, {})
-            job_id = path.parent.name
-            st.write(f"**{job_id}** — {status.get('state', 'unknown')}")
-            if status.get("client"):
-                st.caption(f"{status['client']} · {status.get('stage', '')} · {status.get('message', '')}")
-            if status.get("state") in {"queued", "running", "cancelling"}:
-                if st.button("Cancel job", key="cancel_" + job_id):
-                    (path.parent / "cancel").touch()
-                    st.info("Cancellation requested. Active HTTP requests may finish before the worker stops.")
-            if status.get("errors"):
-                st.dataframe(pd.DataFrame(status["errors"]), hide_index=True)
-            with st.expander("Job log", expanded=False):
-                log_path = path.parent / "worker.log"
-                st.code(log_path.read_text(encoding="utf-8", errors="replace")[-14000:] if log_path.exists() else "Starting…", language="text")
-    monitor()
+def secret_value(st, name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except FileNotFoundError:
+        return default
 
 
-def render_run(st, profiles, selected):
-    st.title("Run selected tools")
-    st.write("Choose the actions you want. Nothing runs automatically when you open a page or change a filter. Selected actions run in the order shown; unselected prerequisites must already have saved data.")
-    settings = read_json(DATA_DIR / "settings.json", {})
-    labels = {p["id"]: p["name"] for p in profiles}
-    chosen = st.multiselect("Clients in this batch", list(labels), default=[selected["id"]] if selected else [], format_func=lambda x: labels[x])
-    available_stages = list(STAGES) if settings.get("runtime_mode", "hosted") == "local" else [k for k in STAGES if k != "crawl"]
-    if "crawl" not in available_stages:
-        st.info("Hosted mode: import Screaming Frog CSVs in Clients & settings. Running your desktop installation requires Local computer mode on that computer.")
-    actions = st.multiselect("Actions to run", available_stages, default=[], format_func=lambda x: STAGES[x])
-    options = dict(settings)
-    if "gsc" in actions:
-        with st.expander("GSC options", expanded=True):
-            try:
-                today_pt = datetime.now(ZoneInfo("America/Los_Angeles")).date()
-            except Exception:
-                today_pt = date.today()
-            end_default = today_pt - timedelta(days=3)
-            cols = st.columns(2)
-            options["start_date"] = str(cols[0].date_input("GSC start date (Pacific reporting dates)", end_default - timedelta(days=89)))
-            options["end_date"] = str(cols[1].date_input("GSC end date", end_default))
-            options["brand_mode"] = st.selectbox("Non-brand classification", ["auto", "native", "local"], format_func=lambda x: {"auto": "Google classification when available; otherwise local brand rules", "native": "Require Google classification", "local": "Use local brand rules"}[x])
-            options["daily_gsc"] = st.checkbox("Download query data one day at a time", value=False, help="More API calls; can improve visible row coverage on larger sites. Weekly chunks are the default.")
-            st.caption("Page metrics are requested separately from query rows. Native classification and query-text filters are not combined.")
-    if "sitemaps" in actions:
-        options["sitemap_cap"] = int(st.number_input("Maximum sitemap files to request", 1, 500, 50))
-    if "content" in actions:
-        with st.expander("Content options", expanded=True):
-            st.caption("Content fetching reads server-returned HTML. JavaScript-only body copy may be unavailable; failed extractions are listed in Content diagnostics.")
-            options["all_content"] = st.checkbox("Fetch all eligible HTML pages", value=False, help="Default: blogs and approved core pages only.")
-            options["refresh_content"] = st.checkbox("Refresh even recently cached content", value=False)
-            options["cache_hours"] = float(st.number_input("Reuse successful content younger than (hours)", 0.0, 720.0, 24.0))
-            options["content_cap"] = int(st.number_input("Maximum pages to fetch / retain for this analysis", 1, 100000, 1500))
-            options["fetch_workers"] = int(st.number_input("Concurrent content requests", 1, 8, 3))
-            options["request_delay"] = float(st.number_input("Minimum delay between request starts (seconds)", 0.2, 30.0, 0.6))
-    if "recommendations" in actions:
-        with st.expander("Recommendation options", expanded=True):
-            options["blog_to_blog"] = st.checkbox("Include blog-to-blog destinations", value=False)
-            options["all_sources"] = st.checkbox("Allow sources beyond blogs", value=False)
-            options["matching_mode"] = st.selectbox("Paragraph matching", ["lexical", "semantic"], format_func=lambda x: "Local word / phrase similarity (standard install)" if x == "lexical" else "Local semantic model (optional install)")
-            if options["matching_mode"] == "semantic":
-                st.caption("Optional: add sentence-transformers>=3.3,<6 to requirements.txt and redeploy. The model runs on the app host; first use needs model files and additional memory.")
-                options["allow_model_download"] = st.checkbox("Allow downloading the semantic model if it is not cached", value=False)
-                options["semantic_threshold"] = st.slider("Minimum semantic paragraph similarity", .2, .9, .45, .01)
-            else:
-                options["lexical_threshold"] = st.slider("Minimum word / phrase paragraph similarity", .05, .6, .14, .01)
-            cols = st.columns(3)
-            options["links_per_source"] = int(cols[0].number_input("Suggestions per source", 1, 20, 3))
-            options["links_per_target"] = int(cols[1].number_input("Suggestions per destination", 1, 50, 5))
-            options["recommendation_cap"] = int(cols[2].number_input("Total suggestions per client", 1, 10000, 300))
-            with st.container(border=True):
-                st.caption("Analysis size limits")
-                options["target_cap"] = int(st.number_input("Maximum destinations to check", 1, 10000, 250))
-                options["paragraph_cap"] = int(st.number_input("Maximum source paragraphs to compare", 100, 200000, 30000))
-                options["paragraphs_per_target"] = int(st.number_input("Candidate paragraphs inspected per destination", 10, 2000, 120))
-                options["ambiguity_margin"] = float(st.number_input("Skip competing destinations within this similarity margin", 0.0, .2, .04, .01))
-            st.caption("Homepage and branded anchors are always excluded from new recommendations. Caps control review workload and are not Google rules.")
-    if "audit" in actions:
-        with st.expander("Audit options", expanded=True):
-            options["audit_checks"] = st.multiselect("Checks to run", list(AUDITS), default=["orphans", "buried", "support"], format_func=lambda x: AUDITS[x])
-            options["depth_threshold"] = int(st.number_input("Flag core pages at this depth or deeper", 2, 30, 4))
-            options["minimum_contextual_sources"] = int(st.number_input("Flag core pages with fewer contextual source pages than", 1, 50, 2))
-    if st.button("Run selected actions", type="primary"):
-        try:
-            if not chosen or not actions:
-                raise ValueError("Select at least one client and one action.")
-            if "audit" in actions and not options.get("audit_checks"):
-                raise ValueError("Choose at least one audit check.")
-            picked_profiles = [p for p in profiles if p["id"] in chosen]
-            for p in picked_profiles:
-                validate_profile(p)
-            job_id = create_job(picked_profiles, actions, options)
-            st.success(f"Started {job_id}. You can switch screens; the local worker continues.")
-        except Exception as exc:
-            st.error(str(exc))
-    st.subheader("Recent jobs")
-    render_job_monitor(st)
+def validate_token_info(value):
+    if not isinstance(value, dict) or not all(value.get(k) for k in ["refresh_token", "client_id", "client_secret"]):
+        raise ValueError("Choose the authorized token JSON created after Google sign-in. It must contain refresh_token, client_id and client_secret.")
+    scopes = value.get("scopes", [])
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    if scopes and not set(scopes).issubset(set(SCOPES)):
+        raise ValueError("Use a token authorized only for Google Search Console read-only access.")
+    return value
 
 
-def render_recommendations(st, p):
-    st.title("Contextual link opportunities")
-    doc = dataset(p, "recommendations")
-    if not doc["meta"]:
-        st.info("Choose Find contextual link opportunities in Run selected tools. No analysis runs when you open this view.")
-        return
-    if doc["meta"].get("input_signature") != input_signature(p, REC_INPUTS):
-        st.warning("Inputs have changed since these recommendations were generated. Run recommendations again before implementation.")
-    show_saved_warnings(st, doc)
-    reviews = read_json(client_dir(p) / "reviews.json", {})
-    rows = [{**r, **reviews.get(r["id"], {})} for r in doc["rows"]]
-    st.caption(f"Saved {doc['meta'].get('created_at')} · {len(rows)} recommendations · {doc['meta'].get('ambiguous_slots_skipped', 0)} ambiguous placements skipped")
+def import_html_csv(profile, source):
+    """Optional SF custom extraction: Address + HTML (or Rendered HTML)."""
+    df = read_sf_csv(source)
+    address = sf_column(df, "Address", "URL")
+    html = sf_column(df, "HTML", "Rendered HTML", "Main HTML", "Page HTML")
+    if not address or not html:
+        raise ValueError("The optional content CSV needs Address and HTML (or Rendered HTML) columns.")
+    rows, blog_urls = [], set(profile.get("blog_urls", []))
+    for raw in df.to_dict("records"):
+        u = url_key(raw.get(address, ""))
+        if not same_site(u, profile) or not raw.get(html):
+            continue
+        page, _, body, _ = page_from_html(str(raw[html]), u, profile)
+        rows.append(body)
+        if page.get("article"):
+            blog_urls.add(u)
     if not rows:
-        st.info("No opportunities passed the selected rules. Review extraction, targets, matching mode and thresholds; the app does not force recommendations.")
+        raise ValueError("No usable HTML records were found for this website.")
+    profile["blog_urls"] = sorted(blog_urls)
+    save_dataset(profile, "content", rows, source="Imported HTML extraction", failed=sum(not r.get("success") for r in rows), partial=False)
+    save_working_profile(profile)
+    return len(rows)
+
+
+def connect_properties(info=None, client_config=None):
+    service = google_service(credentials_info=info, interactive=bool(client_config), client_config=client_config)
+    properties = execute_google(lambda: service.sites().list()).get("siteEntry", [])
+    register_google_properties(properties)
+    return dict(GOOGLE_CREDENTIALS_INFO), properties
+
+
+def render_simple_results(st, profile):
+    result = dataset(profile, "result")["meta"]
+    if not result:
+        st.caption("Select a client and click Find opportunities. Core pages, analysis, charts and workbook are prepared automatically.")
         return
-    cols = st.columns(2)
-    statuses = cols[0].multiselect("Review status", ["Proposed", "Approved", "Dismissed", "Implemented"], default=["Proposed", "Approved"])
-    search = cols[1].text_input("Filter source, destination, anchor or topic")
-    df = pd.DataFrame(rows)
-    filtered = df[df["status"].isin(statuses)]
-    if search:
-        filtered = filtered[filtered[["source_url", "destination_url", "anchor_text", "destination_topic"]].astype(str).apply(lambda c: c.str.contains(search, case=False, regex=False)).any(axis=1)]
-    columns = ["id", "status", "priority", "source_url", "destination_url", "anchor_text", "context", "destination_nonbrand_impressions", "destination_nonbrand_position", "reason", "notes"]
-    edited = st.data_editor(filtered[columns], hide_index=True, width="stretch", key="review_" + p["id"],
-                            disabled=[c for c in columns if c not in {"status", "notes"}],
-                            column_config={"id": None, "status": st.column_config.SelectboxColumn(options=["Proposed", "Approved", "Dismissed", "Implemented"], required=True),
-                                           "source_url": st.column_config.LinkColumn("Source"), "destination_url": st.column_config.LinkColumn("Destination"), "context": st.column_config.TextColumn("Existing paragraph", width="large")})
-    if st.button("Save review decisions"):
-        for row in edited.to_dict("records"):
-            reviews[row["id"]] = {"status": row["status"], "notes": text_norm(row.get("notes", ""))}
-        atomic_json(client_dir(p) / "reviews.json", reviews)
-        st.success("Review decisions saved. Dismissed and implemented placements are suppressed on later recommendation runs.")
-    if not filtered.empty:
-        chosen_id = st.selectbox("Inspect placement", filtered["id"].tolist(), format_func=lambda x: next(f"{r['anchor_text']} → {r['destination_url']}" for r in rows if r["id"] == x))
-        row = next(r for r in rows if r["id"] == chosen_id)
-        st.write("**Existing paragraph**")
-        st.write(row["context"])
-        st.write("**Use this exact unlinked phrase:**", row["anchor_text"])
-        st.code(row["source_locator"], language="css")
-        st.caption(f"Paragraph similarity {row['paragraph_similarity']} ({row['matching_mode']}); heuristic priority score {row['heuristic_score']}. Scores are not ranking forecasts.")
+    cols = st.columns(3)
+    for column, label, key in zip(cols, ["Blog pages checked", "Core pages detected", "Link opportunities"], ["blogs", "core_pages", "opportunities"]):
+        column.metric(label, result.get(key, 0))
+    workbook = Path(result.get("workbook", ""))
+    if workbook.is_file():
+        st.download_button("Download workbook", workbook.read_bytes(), file_name=workbook.name,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", on_click="ignore", type="primary")
+    st.caption(f"Last completed: {result.get('created_at', '')} · {result.get('crawl_source', '')}")
+    with st.expander("Core pages detected"):
+        st.dataframe(pd.DataFrame([{"URL": c["url"], "Topic": c.get("topic", ""), "Found in": c.get("detected_from", "Saved priority page")} for c in profile.get("core_pages", [])]), hide_index=True, width="stretch")
+    if result.get("warnings"):
+        with st.expander("Run notes / coverage"):
+            for warning in result["warnings"]:
+                st.write(warning)
+    tabs = st.tabs(["Opportunities", "Analysis", "Site map"])
+    recs = dataset(profile, "recommendations")["rows"]
+    with tabs[0]:
+        if recs:
+            df = pd.DataFrame(recs).rename(columns={"source_url": "Source page", "destination_url": "Destination page", "anchor_text": "Anchor text", "context": "Existing paragraph", "priority": "Priority"})
+            st.dataframe(df[["Source page", "Destination page", "Anchor text", "Existing paragraph", "Priority"]], hide_index=True, width="stretch",
+                         column_config={"Source page": st.column_config.LinkColumn(), "Destination page": st.column_config.LinkColumn(), "Existing paragraph": st.column_config.TextColumn(width="large")})
+        else:
+            st.info("No suitable unlinked phrases passed the relevance checks. Try another anchor, or review crawl coverage in Run notes.")
+    visuals = {r["kind"]: r for r in dataset(profile, "visuals")["rows"]}
+    import plotly.io as pio
+    with tabs[1]:
+        if "Opportunity chart" in visuals:
+            visual = visuals["Opportunity chart"]
+            st.plotly_chart(pio.from_json(visual["figure_json"]), width="stretch")
+            st.caption(visual["note"])
+        issues = pd.DataFrame(dataset(profile, "audit")["rows"])
+        if not issues.empty:
+            st.dataframe(issues[["issue", "destination_url", "evidence", "recommended_action"]], hide_index=True, width="stretch")
+        else:
+            st.caption("No internal-link issues were found in the available crawl snapshot.")
+    with tabs[2]:
+        choices = [k for k in ["Topic graph", "Crawl tree"] if k in visuals]
+        if choices:
+            view = st.radio("Map view", choices, horizontal=True, key="map_" + profile["id"])
+            st.plotly_chart(pio.from_json(visuals[view]["figure_json"]), width="stretch")
+            st.caption(visuals[view]["note"])
 
 
-def render_audit(st, p):
-    st.title("Existing internal-link audit")
-    doc = dataset(p, "audit")
-    if not doc["meta"]:
-        st.info("Choose Audit existing internal links in Run selected tools, then select the checks you need.")
-        return
-    if doc["meta"].get("input_signature") != input_signature(p, AUDIT_INPUTS):
-        st.warning("The available crawl, GSC, sitemap or profile data has changed. These audit findings are from the previous snapshot.")
-    show_saved_warnings(st, doc)
-    st.caption(doc["meta"].get("coverage", ""))
-    df = pd.DataFrame(doc["rows"])
-    if df.empty:
-        st.info("No findings for the checks selected in the saved audit.")
-    else:
-        issues = st.multiselect("Issue types", sorted(df["issue"].unique()), default=sorted(df["issue"].unique()))
-        st.dataframe(df[df["issue"].isin(issues)], hide_index=True, width="stretch")
-    with st.expander("Saved page summary"):
-        st.dataframe(pd.DataFrame(dataset(p, "page_summary")["rows"]), hide_index=True, width="stretch")
-
-
-def render_visuals(st, p):
-    st.title("Site structure & opportunity")
-    st.write("Build only the view you need from saved data. Graphs are capped for readability.")
-    with st.form("visual_options_" + p["id"]):
-        kind = st.selectbox("View", ["Opportunity chart", "Topic graph", "Crawl tree"])
-        topic = st.text_input("Filter topic labels (optional)")
-        focus = st.text_input("Focus on a page and its immediate neighbors (optional URL)")
-        cap = st.slider("Maximum graph nodes", 20, 300, 150, 10)
-        core_only = st.checkbox("Show core pages only", value=False)
-        content_only = st.checkbox("Graph contextual links only", value=False)
-        show_proposed = st.checkbox("Overlay saved proposed links", value=False)
-        submitted = st.form_submit_button("Build selected visualization", type="primary")
-    cache_key = "visual_" + p["id"]
-    if submitted:
-        try:
-            with st.spinner("Building this view…"):
-                result = make_visual(p, {"visual_type": kind, "topic": topic, "focus_url": url_key(focus), "node_cap": cap,
-                                         "core_only": core_only, "content_only": content_only, "show_proposed": show_proposed})
-                st.session_state[cache_key] = (*result, input_signature(p, AUDIT_INPUTS + ["recommendations"]))
-        except Exception as exc:
-            st.error(str(exc))
-    if cache_key in st.session_state:
-        figure, rows, note, signature = st.session_state[cache_key]
-        if signature != input_signature(p, AUDIT_INPUTS + ["recommendations"]):
-            st.warning("Saved data changed. Build the visualization again to refresh it.")
-        st.plotly_chart(figure, width="stretch")
-        st.caption(note)
-        with st.expander("Pages shown"):
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        with st.expander("Existing link directions for shown pages"):
-            nodes = {r["url"] for r in rows}
-            links = [r for r in dataset(p, "links")["rows"] if r["source"] in nodes and r["destination"] in nodes]
-            st.dataframe(pd.DataFrame(links), hide_index=True, width="stretch")
-
-
-def render_export(st, profiles, selected):
-    st.title("Export workbook")
-    st.write("Choose clients and sheets. Export uses saved results and does not rerun crawling or analysis.")
-    labels = {p["id"]: p["name"] for p in profiles}
-    ids = st.multiselect("Clients to export", list(labels), default=[selected["id"]] if selected else [], format_func=lambda x: labels[x])
-    sheets = st.multiselect("Workbook sheets", ["Recommendations", "Existing-link issues", "Page summary", "GSC pages", "GSC queries", "Content diagnostics", "Existing links", "Run summary"],
-                            default=["Recommendations", "Existing-link issues", "Page summary", "Run summary"])
-    if st.button("Prepare selected workbook", type="primary"):
-        try:
-            if not ids or not sheets:
-                raise ValueError("Choose at least one client and one sheet.")
-            picked = [p for p in profiles if p["id"] in ids]
-            with st.spinner("Preparing workbook…"):
-                content = workbook_bytes(picked, sheets)
-            filename = f"internal_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            path = DATA_DIR / "exports" / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
-            st.session_state["export_payload"] = (filename, content)
-            st.success("Workbook prepared. Run summary identifies saved dates, coverage and outdated analyses when that sheet is included.")
-        except Exception as exc:
-            st.error(str(exc))
-    if "export_payload" in st.session_state:
-        filename, content = st.session_state["export_payload"]
-        st.download_button("Download prepared workbook", data=content, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", on_click="ignore")
+def render_live_progress(st, job_id):
+    @st.fragment(run_every="1s")
+    def monitor():
+        folder = DATA_DIR / "jobs" / job_id
+        status = read_json(folder / "status.json", {})
+        state = status.get("state", "queued")
+        step = f"Step {status.get('phase_index', 0) + 1}/{status.get('phase_count', 6)}"
+        st.progress(float(max(0, min(1, status.get("overall_progress", 0)))), text=f"{step} · {status.get('stage', 'Starting…')} · {status.get('message', '')}")
+        if state in {"queued", "running"}:
+            if status.get("total"):
+                st.caption(f"{status.get('done', 0):,} of {status['total']:,} items in the current stage. Crawl totals may grow as new pages are discovered.")
+            if st.button("Stop", key="stop_" + job_id):
+                (folder / "cancel").touch()
+                st.info("Stopping after active requests finish…")
+        elif state == "completed":
+            st.success("Opportunities, analysis, charts and workbook are ready.")
+        elif state == "cancelled":
+            st.info("Stopped. Previously completed results remain available.")
+        elif state in {"failed", "completed_with_errors"}:
+            errors = status.get("errors", [])
+            st.error(errors[-1].get("error", "The run could not finish.") if errors else "The run could not finish.")
+        if state in {"completed", "cancelled", "failed", "completed_with_errors"} and st.session_state.get("finished_job") != job_id:
+            st.session_state["finished_job"] = job_id
+            st.rerun()
+        with st.expander("Progress details"):
+            log_file = folder / "worker.log"
+            if log_file.is_file():
+                st.code(log_file.read_text(encoding="utf-8", errors="replace")[-6000:], language="text")
+    monitor()
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title="Internal linking workbench", page_icon="🔗", layout="wide")
-    try:
-        password = st.secrets.get("app_password", "")
-    except FileNotFoundError:
-        password = ""
+    st.set_page_config(page_title="Internal linking opportunities", page_icon="🔗", layout="wide")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    settings = read_json(DATA_DIR / "settings.json", {})
+    password = str(secret_value(st, "app_password"))
+    secret_token = secret_value(st, "gsc_token_json")
+    profiles = read_json(DATA_DIR / "profiles.json", [])
+    legacy_token = DATA_DIR / "auth" / "gsc_token.json"
+    has_private_data = any(not p.get("demo") and (client_dir(p) / "gsc_pages.json").exists() for p in profiles)
+    if settings.get("runtime_mode", "hosted") != "local" and not password and (secret_token or legacy_token.exists() or has_private_data):
+        st.title("Internal linking opportunities")
+        st.info("Add an app password in Streamlit Secrets before connecting or viewing client Search Console data.")
+        st.code('app_password = "choose-a-private-password"', language="toml")
+        st.stop()
     if password and not st.session_state.get("_authenticated"):
-        st.title("Internal linking workbench")
+        st.title("Internal linking opportunities")
         entered = st.text_input("App password", type="password")
         if st.button("Sign in"):
-            if hmac.compare_digest(entered.encode("utf-8"), str(password).encode("utf-8")):
+            if hmac.compare_digest(entered.encode(), password.encode()):
                 st.session_state["_authenticated"] = True
                 st.rerun()
             else:
                 st.error("Incorrect password.")
         st.stop()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    profiles = read_json(DATA_DIR / "profiles.json", [])
-    st.sidebar.title("Internal linking workbench")
-    selected = None
-    if profiles:
-        profile_ids = [p["id"] for p in profiles]
-        if st.session_state.get("selected_client") not in profile_ids:
-            st.session_state["selected_client"] = profile_ids[0]
-        client_id = st.sidebar.selectbox("Client", profile_ids, key="selected_client", format_func=lambda x: next(p["name"] for p in profiles if p["id"] == x))
-        selected = next(p for p in profiles if p["id"] == client_id)
-    screens = ["Clients & settings", "Run selected tools", "Recommendations", "Audit", "Visualizations", "Export", "Demo & help"]
-    screen = st.sidebar.radio("Open", screens)
-    st.sidebar.caption("Every feature runs only when you request it. Saved data is reused across screens.")
-    if selected:
-        if selected.get("demo"):
-            st.info("Demo client: all pages and metrics are synthetic. No live website data is represented.")
-        docs = [dataset(selected, name) for name in ["pages", "gsc_pages", "content", "recommendations"]]
-        cols = st.columns(4)
-        for col, label, doc in zip(cols, ["Crawled URLs", "Non-brand GSC pages", "Content records", "Saved opportunities"], docs):
-            col.metric(label, len(doc["rows"]))
-    if screen == "Clients & settings":
-        render_settings(st, profiles, selected)
-    elif screen == "Demo & help":
-        st.title("Try the workflow")
-        st.write("The demo creates local synthetic crawl, content, sitemap and GSC datasets. It does not run recommendations, audits, charts or exports.")
-        if st.button("Create / reset synthetic demo client"):
-            install_demo()
-            st.success("Demo datasets created. Select the demo client, then choose the individual tools you want to try.")
-        st.markdown("""1. Select a client and review its settings.\n2. Import Internal:All and All Inlinks CSV exports from the same Screaming Frog crawl. In Local computer mode you can launch a crawl from this app.\n3. Choose sitemap discovery, GSC download and content fetching as needed.\n4. Run recommendations or selected audit checks against saved inputs.\n5. Review results, build a visualization, or export selected sheets.\n\n**GitHub deployment:** Commit only app.py and requirements.txt at repository root. Set the Streamlit entrypoint to app.py. Use Streamlit Secrets for app_password and gsc_token_json, or upload an authorized GSC token in Clients & settings. The app works with demo data before any credentials are added.\n\n**Cloud storage:** Download workbooks and client-settings backups you want to retain; files on the app host may be lost on reboot/redeploy. This version does not include a remote worker controlling your laptop.\n\n**Optional semantic mode:** Add sentence-transformers>=3.3,<6 to requirements.txt and redeploy. It uses additional host memory. Standard word/phrase matching works with the supplied requirements.\n\n**Local setup:** Install Python 3.11 or 3.12, run `python -m pip install -r requirements.txt`, then `python -m streamlit run app.py`. Choose Local computer mode in settings to enable desktop OAuth and the licensed Screaming Frog CLI.\n\n**Quality checks:** Confirm the phrase and destination in the live page before implementation. Crawl depth, similarity and internal rank are local models; important navigation changes may require a separate implementation task.""")
-    elif screen == "Run selected tools":
-        render_run(st, profiles, selected)
-    elif screen == "Export":
-        render_export(st, profiles, selected)
-    elif not selected:
-        st.info("Add a client or create the demo client first.")
-    elif screen == "Recommendations":
-        render_recommendations(st, selected)
-    elif screen == "Audit":
-        render_audit(st, selected)
-    elif screen == "Visualizations":
-        render_visuals(st, selected)
-
+    # Migrate the v1 generated token into authenticated session memory, then remove
+    # that plaintext copy. Credentials are never written back to the filesystem.
+    if legacy_token.is_file():
+        try:
+            st.session_state.setdefault("gsc_credentials", validate_token_info(read_json(legacy_token)))
+            legacy_token.unlink()
+        except (ValueError, OSError):
+            pass
+    info = st.session_state.get("gsc_credentials")
+    if not info and secret_token:
+        try:
+            info = validate_token_info(json.loads(secret_token) if isinstance(secret_token, str) else dict(secret_token))
+            st.session_state["gsc_credentials"] = info
+        except ValueError:
+            info = None
+    if info and not profiles and not st.session_state.get("auto_connection_attempted"):
+        st.session_state["auto_connection_attempted"] = True
+        try:
+            with st.spinner("Loading your clients from Search Console…"):
+                info, _ = connect_properties(info)
+                st.session_state["gsc_credentials"] = info
+                profiles = read_json(DATA_DIR / "profiles.json", [])
+        except Exception as exc:
+            st.warning(safe_error(exc))
+    st.sidebar.caption("One-time connection and optional crawl controls")
+    with st.sidebar.expander("Connection & crawl options", expanded=False):
+        runtime = st.selectbox("Run on", ["hosted", "local"], index=0 if settings.get("runtime_mode", "hosted") != "local" else 1,
+                               format_func=lambda x: "Streamlit Cloud — automatic web crawl" if x == "hosted" else "This computer — Screaming Frog when available")
+        settings["runtime_mode"] = runtime
+        settings["refresh_crawl"] = st.checkbox("Refresh saved crawl and GSC data", value=False)
+        settings["crawl_limit"] = int(st.number_input("Maximum pages per crawl", 100, 20000, int(settings.get("crawl_limit", 2000)), 100))
+        if runtime == "local":
+            settings["sf_path"] = st.text_input("Screaming Frog CLI path (optional)", settings.get("sf_path", ""))
+        token_upload = st.file_uploader("Google authorized token JSON", type="json", help="Stored in session memory. For persistence, use gsc_token_json in Streamlit Secrets.")
+        if st.button("Connect Google / refresh clients"):
+            try:
+                if runtime == "hosted" and not password:
+                    raise ValueError("Set app_password in Streamlit Secrets before connecting Google.")
+                value = json.loads(token_upload.getvalue()) if token_upload else info
+                if not value:
+                    raise ValueError("Upload your authorized GSC token JSON or configure gsc_token_json in Streamlit Secrets.")
+                local_config = value if runtime == "local" and "installed" in value else None
+                token = None if local_config else validate_token_info(value)
+                with st.spinner("Connecting…"):
+                    connected, _ = connect_properties(token, local_config)
+                st.session_state["gsc_credentials"] = connected
+                atomic_json(DATA_DIR / "settings.json", settings)
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+        site_url = st.text_input("Add a website without GSC (optional)", placeholder="https://example.com/")
+        if st.button("Add website"):
+            if url_key(site_url):
+                profile = default_profile(urlsplit(site_url).hostname or "Client", site_url)
+                automatic_brand_terms(profile)
+                save_working_profile(profile)
+                st.session_state["selected_client"] = profile["id"]
+                st.rerun()
+            else:
+                st.error("Enter a complete https:// website URL.")
+        if st.button("Try demo"):
+            demo = install_demo()
+            st.session_state["selected_client"] = demo["id"]
+            st.rerun()
+        if profiles:
+            with st.popover("Use Screaming Frog exports (optional)"):
+                current_id = st.session_state.get("selected_client", profiles[0]["id"])
+                current_profile = next((p for p in profiles if p["id"] == current_id), profiles[0])
+                st.caption(f"For {current_profile['name']}. Automatic web crawling needs no uploads. Use these exports if the site blocks access or needs rendered HTML.")
+                internal_csv = st.file_uploader("Internal:All CSV", type="csv")
+                inlinks_csv = st.file_uploader("All Inlinks CSV", type="csv")
+                content_csv = st.file_uploader("Optional HTML extraction CSV (Address + HTML)", type="csv")
+                if st.button("Use these crawl files", disabled=internal_csv is None or inlinks_csv is None):
+                    try:
+                        save_crawl(current_profile, read_sf_csv(io.BytesIO(internal_csv.getvalue())), read_sf_csv(io.BytesIO(inlinks_csv.getvalue())), "Imported Screaming Frog exports")
+                        if content_csv:
+                            import_html_csv(current_profile, io.BytesIO(content_csv.getvalue()))
+                        st.success("Crawl imported. Click Find opportunities to prepare all results.")
+                    except Exception as exc:
+                        st.error(safe_error(exc))
+    st.title("Internal linking opportunities")
+    st.caption("Blog pages → relevant core pages. Core pages are detected from navigation and footer links.")
+    if not profiles:
+        st.info("Connect Google once under Connection & crawl options to load your clients, or add a website there. You can also try the demo.")
+        return
+    ids = [p["id"] for p in profiles]
+    if st.session_state.get("selected_client") not in ids:
+        st.session_state["selected_client"] = ids[0]
+    selected = st.selectbox("Client", ids, key="selected_client", format_func=lambda x: next(p["name"] for p in profiles if p["id"] == x))
+    profile = next(p for p in profiles if p["id"] == selected)
+    if profile.get("demo"):
+        st.info("Demo: all pages and metrics are synthetic. No external crawl or Google request will run.")
+    anchor = st.text_input("Anchor text (optional)", placeholder="Leave blank for automatic suggestions, or enter e.g. options data API")
+    destination = ""
+    if anchor and profile.get("core_pages"):
+        with st.expander("Choose a destination for this anchor (optional)"):
+            choices = [""] + [c["url"] for c in profile["core_pages"]]
+            destination = st.selectbox("Link to", choices, format_func=lambda x: x or "Automatically choose a relevant core page")
+    active = read_json(DATA_DIR / "jobs" / "queue.lock", {}).get("job_id")
+    if active:
+        folder = DATA_DIR / "jobs" / active
+        active_status = read_json(folder / "status.json", {})
+        record = read_json(folder / "process.json", {})
+        if active_status.get("state") in {"completed", "failed", "cancelled", "completed_with_errors"} or (record and not process_alive(record)):
+            if active_status.get("state") in {"queued", "running"}:
+                active_status.update(state="failed", errors=[{"error": "The worker stopped unexpectedly. You can start the run again."}])
+                atomic_json(folder / "status.json", active_status)
+            release_job_lock(active)
+            active = None
+    if st.button("Find opportunities", type="primary", disabled=bool(active)):
+        try:
+            options = {**settings, "anchor_text": anchor.strip(), "destination_url": destination}
+            atomic_json(DATA_DIR / "settings.json", settings)
+            job_id = create_job([profile], [], options, credentials_info=st.session_state.get("gsc_credentials"), workflow="simple")
+            st.session_state["active_job"] = job_id
+            st.rerun()
+        except Exception as exc:
+            st.error(safe_error(exc))
+    job_id = active or st.session_state.get("active_job")
+    if job_id:
+        render_live_progress(st, job_id)
+    render_simple_results(st, profile)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
