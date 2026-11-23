@@ -30,6 +30,7 @@ import json
 import math
 import os
 import platform
+import queue
 import re
 import shutil
 import socket
@@ -52,9 +53,11 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("INTERNAL_LINK_DATA_DIR", str(APP_DIR / "data"))).expanduser().resolve()
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 GOOGLE_CREDENTIALS_INFO = None  # Worker memory only; never included in job JSON.
 GOOGLE_CALLBACK_PATH = "/component/streamlit_oauth.authorize_button/index.html"
+GOOGLE_HTTP_TIMEOUT = 15
+GOOGLE_CONNECT_TIMEOUT = 45
 UA = "CadenceInternalLinks/1.0"
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -929,19 +932,25 @@ def built_in_crawl(profile, options, log, check_cancel, homepage=None):
     return counters
 
 
-def google_service(interactive=False, secret_path="", credentials_info=None, client_config=None):
+def google_service(interactive=False, secret_path="", credentials_info=None, client_config=None, return_credentials=False):
     """Credentials stay in memory. Workers receive them through a stdin pipe."""
     global GOOGLE_CREDENTIALS_INFO
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
+    import google_auth_httplib2
+    import httplib2
     credentials = None
     info = credentials_info or (None if client_config else GOOGLE_CREDENTIALS_INFO)
     if info:
         credentials = Credentials.from_authorized_user_info(info, SCOPES)
         if not credentials.valid and credentials.refresh_token:
-            credentials.refresh(Request())
+            request = Request()
+            def bounded_request(*args, **kwargs):
+                kwargs["timeout"] = GOOGLE_HTTP_TIMEOUT
+                return request(*args, **kwargs)
+            credentials.refresh(bounded_request)
     if not credentials or not credentials.valid:
         if not interactive:
             raise ValueError("Connect Google under Connection & crawl options, or configure gsc_token_json in Streamlit Secrets.")
@@ -949,18 +958,21 @@ def google_service(interactive=False, secret_path="", credentials_info=None, cli
             raise ValueError("Provide a Desktop OAuth client configuration for local sign-in.")
         flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
         credentials = flow.run_local_server(host="localhost", port=0, open_browser=True, timeout_seconds=180)
-    GOOGLE_CREDENTIALS_INFO = json.loads(credentials.to_json())
-    return build("searchconsole", "v1", credentials=credentials, cache_discovery=False)
+    updated = json.loads(credentials.to_json())
+    GOOGLE_CREDENTIALS_INFO = updated
+    http = google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT), max_refresh_attempts=1)
+    service = build("searchconsole", "v1", http=http, cache_discovery=False, static_discovery=True)
+    return (service, updated) if return_credentials else service
 
 
-def execute_google(request_factory, check_cancel=lambda: None):
-    for attempt in range(5):
+def execute_google(request_factory, check_cancel=lambda: None, max_attempts=5):
+    for attempt in range(max_attempts):
         check_cancel()
         try:
             return request_factory().execute()
         except Exception as exc:
             status = getattr(getattr(exc, "resp", None), "status", None)
-            if status not in {429, 500, 502, 503, 504} or attempt == 4:
+            if status not in {429, 500, 502, 503, 504} or attempt == max_attempts - 1:
                 raise
             until = time.monotonic() + min(30, 2 ** attempt)
             while time.monotonic() < until:
@@ -1899,6 +1911,13 @@ def save_working_profile(profile):
 
 
 def safe_error(exc):
+    current = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError) or type(current).__name__ in {"Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError"}:
+            return "Google took too long to respond. Click Refresh client list to retry; if sign-in did not finish, click Restart Google sign-in."
+        current = current.__cause__ or current.__context__
     if type(exc).__name__ in {"RefreshError", "OAuthError", "TokenExpiredError"}:
         return "Google authorization expired or was revoked. Reconnect Google in Connection & crawl options."
     status = getattr(getattr(exc, "resp", None), "status", None)
@@ -2225,7 +2244,7 @@ def finish_google_authorization(pending, response):
     if not isinstance(code, str) or not code.strip():
         raise ValueError("Google did not return an authorization code. Connect Google again.")
     flow = pending["flow"]
-    flow.fetch_token(code=code)
+    flow.fetch_token(code=code, timeout=GOOGLE_HTTP_TIMEOUT)
     token = validate_token_info(json.loads(flow.credentials.to_json()))
     return token
 
@@ -2242,10 +2261,8 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
         st.caption("Connected · Search Console read-only")
         if st.button("Refresh client list", key="google_refresh"):
             try:
-                with st.spinner("Loading your clients…"):
-                    connected, properties = connect_properties(info)
-                    st.session_state["gsc_credentials"] = connected
-                    st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
+                connected, properties = run_google_connection(st, info=info, reset_selection=False)
+                st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
                 st.rerun()
             except Exception as exc:
                 st.error(safe_error(exc))
@@ -2261,9 +2278,7 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
             return
         if st.button("Connect Google", key="google_local"):
             try:
-                with st.spinner("Finish Google sign-in in your browser…"):
-                    connected, _ = connect_properties(client_config=config)
-                st.session_state["gsc_credentials"] = connected
+                run_google_connection(st, client_config=config)
                 st.rerun()
             except Exception as exc:
                 st.error(safe_error(exc))
@@ -2281,15 +2296,15 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
             st.session_state["_google_pending"] = pending
         response = _authorize_button(authorization_url=pending["authorization_url"], name="Connect Google", popup_height=750,
                                      popup_width=600, key="google_" + pending["id"], use_container_width=True, auto_click=False)
-        st.caption("Sign in and allow read-only access. Keep this app tab open; allow the Google popup if your browser blocks it.")
+        st.caption("Waiting for Google sign-in. Keep this app tab open. Connecting only loads your client list; no crawl runs yet.")
+        if st.button("Restart Google sign-in", key="google_restart"):
+            st.session_state.pop("_google_pending", None)
+            st.rerun()
+        st.caption("If you already approved access but the popup stays open, close that popup and restart sign-in. The return URL in Google Cloud and Streamlit Secrets must match exactly.")
         if response:
             try:
-                with st.spinner("Connecting to Search Console…"):
-                    token = finish_google_authorization(pending, response)
-                    st.session_state["gsc_credentials"] = token
-                    connected, properties = connect_properties(token)
-                    st.session_state["gsc_credentials"] = connected
-                    st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
+                connected, properties = run_google_connection(st, pending=pending, response=response)
+                st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
             except Exception as exc:
                 st.session_state["google_notice"] = safe_error(exc)
             finally:
@@ -2298,9 +2313,7 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
     elif uploaded:
         if st.button("Connect Google", key="google_token"):
             try:
-                with st.spinner("Connecting to Search Console…"):
-                    connected, _ = connect_properties(validate_token_info(uploaded))
-                st.session_state["gsc_credentials"] = connected
+                run_google_connection(st, info=validate_token_info(uploaded))
                 st.rerun()
             except Exception as exc:
                 st.error(safe_error(exc))
@@ -2332,11 +2345,99 @@ def import_html_csv(profile, source):
     return len(rows)
 
 
+def fetch_google_properties(info=None, client_config=None, on_credentials=lambda _: None):
+    """Read-only network work. A late response must never save client profiles."""
+    service, connected = google_service(credentials_info=info, interactive=bool(client_config), client_config=client_config,
+                                        return_credentials=True)
+    on_credentials(connected)
+    try:
+        properties = execute_google(lambda: service.sites().list(), max_attempts=1).get("siteEntry", [])
+    finally:
+        service.close()
+    return connected, properties
+
+
 def connect_properties(info=None, client_config=None):
-    service = google_service(credentials_info=info, interactive=bool(client_config), client_config=client_config)
-    properties = execute_google(lambda: service.sites().list()).get("siteEntry", [])
+    connected, properties = fetch_google_properties(info, client_config)
     register_google_properties(properties)
-    return dict(GOOGLE_CREDENTIALS_INFO), properties
+    return connected, properties
+
+
+def run_google_connection(st, info=None, client_config=None, pending=None, response=None, reset_selection=True):
+    """Keep UI responsive, show actual stages, and bound the full connection."""
+    st.session_state["auto_connection_attempted"] = True
+    events = queue.Queue()
+    done = threading.Event()
+    cancelled = threading.Event()
+    limit = 210 if client_config and "installed" in client_config else GOOGLE_CONNECT_TIMEOUT
+
+    def emit(kind, value):
+        if not cancelled.is_set():
+            events.put((kind, value))
+
+    def worker():
+        try:
+            token = info
+            if pending is not None:
+                emit("stage", "1/3 · Completing Google authorization")
+                token = finish_google_authorization(pending, response)
+                emit("credentials", token)
+            else:
+                emit("stage", "1/3 · Checking Google authorization")
+            if cancelled.is_set():
+                return
+            emit("stage", "2/3 · Loading Search Console client list")
+            result = fetch_google_properties(token, client_config, on_credentials=lambda value: emit("credentials", value))
+            emit("result", result)
+        except Exception as exc:
+            emit("error", exc)
+        finally:
+            done.set()
+
+    result, error = None, None
+    started = time.monotonic()
+    with st.status("Connecting Google…", expanded=True) as status:
+        threading.Thread(target=worker, name="google-connect", daemon=True).start()
+        try:
+            while True:
+                while True:
+                    try:
+                        kind, value = events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if kind == "stage":
+                        status.update(label=value)
+                        status.write(value)
+                    elif kind == "credentials":
+                        st.session_state["gsc_credentials"] = value
+                    elif kind == "result":
+                        result = value
+                    elif kind == "error":
+                        error = value
+                if done.is_set() and events.empty():
+                    break
+                if time.monotonic() - started >= limit:
+                    raise TimeoutError("Google connection exceeded its time limit.")
+                done.wait(.1)
+            if error is not None:
+                raise error
+            if result is None:
+                raise TimeoutError("Google connection did not finish.")
+            connected, properties = result
+            status.update(label="3/3 · Preparing your client selector")
+            status.write("3/3 · Preparing your client selector")
+            register_google_properties(properties)
+            st.session_state["gsc_credentials"] = connected
+            if reset_selection:
+                st.session_state["selected_client"] = None
+            status.update(label=f"Connected · {len(properties)} Search Console properties", state="complete", expanded=False)
+            return connected, properties
+        except Exception:
+            cancelled.set()
+            status.update(label="Connection stopped · retry is available", state="error", expanded=True)
+            raise
+        finally:
+            cancelled.set()
 
 
 def render_simple_results(st, profile):
@@ -2445,6 +2546,8 @@ def main():
             else:
                 st.error("Incorrect password.")
         st.stop()
+    st.title("Internal linking opportunities")
+    st.caption("Blog pages → relevant core pages. Core pages are detected from navigation and footer links.")
     # Migrate the v1 generated token into authenticated session memory, then remove
     # that plaintext copy. Credentials are never written back to the filesystem.
     if legacy_token.is_file():
@@ -2463,10 +2566,8 @@ def main():
     if info and not profiles and not st.session_state.get("auto_connection_attempted"):
         st.session_state["auto_connection_attempted"] = True
         try:
-            with st.spinner("Loading your clients from Search Console…"):
-                info, _ = connect_properties(info)
-                st.session_state["gsc_credentials"] = info
-                profiles = read_json(DATA_DIR / "profiles.json", [])
+            info, _ = run_google_connection(st, info=info)
+            profiles = read_json(DATA_DIR / "profiles.json", [])
         except Exception as exc:
             st.warning(safe_error(exc))
     google_panel = st.sidebar.container()
@@ -2520,15 +2621,17 @@ def main():
             render_google_connection(st, config, runtime, password, info, uploaded)
         except (ValueError, ImportError) as exc:
             st.error(safe_error(exc))
-    st.title("Internal linking opportunities")
-    st.caption("Blog pages → relevant core pages. Core pages are detected from navigation and footer links.")
     if not profiles:
         st.info("Click Connect Google in the sidebar to load your clients. You can also add a website or try the demo under Connection & crawl options.")
         return
     ids = [p["id"] for p in profiles]
     if st.session_state.get("selected_client") not in ids:
-        st.session_state["selected_client"] = ids[0]
-    selected = st.selectbox("Client", ids, key="selected_client", format_func=lambda x: next(p["name"] for p in profiles if p["id"] == x))
+        st.session_state["selected_client"] = None
+    selected = st.selectbox("Client", ids, index=None, placeholder="Choose a client…", key="selected_client",
+                            format_func=lambda x: next(p["name"] for p in profiles if p["id"] == x))
+    if not selected:
+        st.info("Choose a client first. Crawling, Search Console performance data and analysis start only after you click Find opportunities.")
+        return
     profile = next(p for p in profiles if p["id"] == selected)
     if profile.get("demo"):
         st.info("Demo: all pages and metrics are synthetic. No external crawl or Google request will run.")
