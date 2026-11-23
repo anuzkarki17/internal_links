@@ -3,9 +3,13 @@ then click Find opportunities. Navigation/footer core-page discovery, crawling,
 GSC enrichment, matching, audit, charts and workbook generation run together.
 
 GitHub: commit app.py and requirements.txt; Streamlit entrypoint is app.py.
-Optional one-time Secrets:
+One-time Secrets for Google sign-in on Streamlit Cloud:
     app_password = "a-private-password"
-    gsc_token_json = '<the complete authorized GSC token JSON>'
+    google_client_secret_json = '<complete downloaded Web application JSON>'
+    google_redirect_uri = 'https://YOUR-APP.streamlit.app/component/streamlit_oauth.authorize_button/index.html'
+Register that exact redirect URI on the Google Cloud Web application client.
+On a local Windows installation, google_client_secret_path can point to a
+Desktop client JSON instead. Existing gsc_token_json credentials still work.
 
 Google credentials stay in memory and travel to a background worker through a
 stdin pipe. Never commit credentials. Cloud mode uses a bounded HTML crawler;
@@ -48,8 +52,9 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("INTERNAL_LINK_DATA_DIR", str(APP_DIR / "data"))).expanduser().resolve()
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 GOOGLE_CREDENTIALS_INFO = None  # Worker memory only; never included in job JSON.
+GOOGLE_CALLBACK_PATH = "/component/streamlit_oauth.authorize_button/index.html"
 UA = "CadenceInternalLinks/1.0"
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -932,7 +937,7 @@ def google_service(interactive=False, secret_path="", credentials_info=None, cli
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
     credentials = None
-    info = credentials_info or GOOGLE_CREDENTIALS_INFO
+    info = credentials_info or (None if client_config else GOOGLE_CREDENTIALS_INFO)
     if info:
         credentials = Credentials.from_authorized_user_info(info, SCOPES)
         if not credentials.valid and credentials.refresh_token:
@@ -2119,14 +2124,188 @@ def secret_value(st, name, default=""):
 
 
 def validate_token_info(value):
+    if isinstance(value, dict) and ("installed" in value or "web" in value):
+        raise ValueError("This is Google's client configuration. Use Connect Google to sign in; it is not an authorized token yet.")
     if not isinstance(value, dict) or not all(value.get(k) for k in ["refresh_token", "client_id", "client_secret"]):
-        raise ValueError("Choose the authorized token JSON created after Google sign-in. It must contain refresh_token, client_id and client_secret.")
+        raise ValueError("This file does not contain reusable Google authorization. Use your downloaded client configuration with Connect Google.")
     scopes = value.get("scopes", [])
     if isinstance(scopes, str):
         scopes = scopes.split()
     if scopes and not set(scopes).issubset(set(SCOPES)):
         raise ValueError("Use a token authorized only for Google Search Console read-only access.")
     return value
+
+
+def validate_google_client_config(value):
+    """Accept Google's download unchanged, but never trust arbitrary endpoints."""
+    if not isinstance(value, dict):
+        raise ValueError("Choose the JSON client configuration downloaded from Google Cloud.")
+    kind = "web" if isinstance(value.get("web"), dict) else "installed" if isinstance(value.get("installed"), dict) else None
+    if not kind:
+        raise ValueError("The Google client JSON must contain a web or installed section.")
+    config = dict(value[kind])
+    if not all(isinstance(config.get(k), str) and config[k].strip() for k in ("client_id", "client_secret")):
+        raise ValueError("The Google client configuration needs client_id and client_secret.")
+    if not config["client_id"].endswith(".apps.googleusercontent.com"):
+        raise ValueError("Use the OAuth client ID from your Google Cloud download.")
+    if config.get("auth_uri") not in {None, "https://accounts.google.com/o/oauth2/auth", "https://accounts.google.com/o/oauth2/v2/auth"}:
+        raise ValueError("The client configuration does not use Google's authorization endpoint.")
+    if config.get("token_uri") not in {None, "https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/token"}:
+        raise ValueError("The client configuration does not use Google's token endpoint.")
+    config.update(auth_uri="https://accounts.google.com/o/oauth2/v2/auth", token_uri="https://oauth2.googleapis.com/token")
+    return {kind: config}
+
+
+def load_google_client_config(st, runtime):
+    value = secret_value(st, "google_client_secret_json")
+    path = secret_value(st, "google_client_secret_path")
+    if not value and not path:
+        # Recognize a client download previously put in the old token setting.
+        legacy = secret_value(st, "gsc_token_json")
+        try:
+            candidate = json.loads(legacy) if isinstance(legacy, str) and legacy else dict(legacy or {})
+        except (TypeError, ValueError):
+            candidate = {}
+        if "web" in candidate or "installed" in candidate:
+            value = candidate
+    if value:
+        try:
+            value = json.loads(value) if isinstance(value, str) else dict(value)
+        except (TypeError, ValueError):
+            raise ValueError("google_client_secret_json must contain the downloaded JSON contents, rather than a file path.") from None
+        return validate_google_client_config(value)
+    if path:
+        if runtime != "local":
+            raise ValueError("Streamlit Cloud cannot open your laptop's C: drive. Put the file contents in google_client_secret_json in Secrets.")
+        try:
+            value = json.loads(Path(str(path)).expanduser().read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            raise ValueError("Could not open the Google client JSON on this computer. Check google_client_secret_path.") from None
+        return validate_google_client_config(value)
+    return None
+
+
+def google_redirect_uri(st, config, runtime):
+    if "web" not in config:
+        raise ValueError("This is a Desktop OAuth client. For Streamlit Cloud, create a Web application client in Google Cloud, register the return URL, then use its downloaded JSON.")
+    redirect = str(secret_value(st, "google_redirect_uri")).strip()
+    if not redirect:
+        choices = [u for u in config["web"].get("redirect_uris", []) if isinstance(u, str) and u.endswith(GOOGLE_CALLBACK_PATH)]
+        if len(choices) == 1:
+            redirect = choices[0]
+    parsed = urlsplit(redirect)
+    local = parsed.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
+    if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path != GOOGLE_CALLBACK_PATH or (parsed.scheme != "https" and not (runtime == "local" and local and parsed.scheme == "http"))
+            or (runtime != "local" and local)):
+        raise ValueError("Set google_redirect_uri to your app's HTTPS URL followed by " + GOOGLE_CALLBACK_PATH + ". Register the exact same URL in Google Cloud.")
+    return redirect
+
+
+def begin_google_authorization(config, redirect_uri):
+    from google_auth_oauthlib.flow import Flow
+    flow = Flow.from_client_config(validate_google_client_config(config), SCOPES, redirect_uri=redirect_uri,
+                                   autogenerate_code_verifier=True)
+    url, state = flow.authorization_url(access_type="offline", prompt="consent select_account", include_granted_scopes="false")
+    return {"flow": flow, "authorization_url": url, "state": state, "created_at": time.monotonic(), "id": uuid.uuid4().hex}
+
+
+def finish_google_authorization(pending, response):
+    """Require this browser session's one-use state before exchanging a code."""
+    if pending.get("used"):
+        raise ValueError("This Google sign-in has already been used. Connect Google again.")
+    pending["used"] = True
+    if time.monotonic() - pending["created_at"] > 600:
+        raise ValueError("Google sign-in timed out. Connect Google again.")
+    if not isinstance(response, dict) or not isinstance(response.get("state"), str) or not hmac.compare_digest(response["state"].encode(), pending["state"].encode()):
+        raise ValueError("The Google sign-in could not be verified. Connect Google again.")
+    if response.get("error"):
+        raise ValueError("Google access was not granted. Connect Google again and allow Search Console read-only access.")
+    code = response.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("Google did not return an authorization code. Connect Google again.")
+    flow = pending["flow"]
+    flow.fetch_token(code=code)
+    token = validate_token_info(json.loads(flow.credentials.to_json()))
+    return token
+
+
+def render_google_connection(st, config, runtime, password, info, uploaded=None):
+    st.markdown("**Google Search Console**")
+    if runtime == "hosted" and not password:
+        st.caption("Set app_password in Streamlit Secrets to enable Google access.")
+        return
+    notice = st.session_state.pop("google_notice", "")
+    if notice:
+        st.info(notice)
+    if info:
+        st.caption("Connected · Search Console read-only")
+        if st.button("Refresh client list", key="google_refresh"):
+            try:
+                with st.spinner("Loading your clients…"):
+                    connected, properties = connect_properties(info)
+                    st.session_state["gsc_credentials"] = connected
+                    st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+        if st.button("Disconnect Google", key="google_disconnect"):
+            st.session_state.pop("gsc_credentials", None)
+            st.session_state.pop("_google_pending", None)
+            st.session_state["skip_secret_token"] = True
+            st.rerun()
+        return
+    if config and "installed" in config:
+        if runtime != "local":
+            st.info("Your JSON is a Desktop client. Streamlit Cloud needs a Web application client with your app's return URL. Put that download in google_client_secret_json in Secrets.")
+            return
+        if st.button("Connect Google", key="google_local"):
+            try:
+                with st.spinner("Finish Google sign-in in your browser…"):
+                    connected, _ = connect_properties(client_config=config)
+                st.session_state["gsc_credentials"] = connected
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+        return
+    if config:
+        # This pinned dependency supplies only the popup UI. Google's library
+        # performs the server-side exchange; we enforce mandatory state + PKCE.
+        from streamlit_oauth import _authorize_button
+        redirect = google_redirect_uri(st, config, runtime)
+        identity = digest({"client_id": config["web"]["client_id"], "redirect": redirect})
+        pending = st.session_state.get("_google_pending")
+        if not pending or pending.get("identity") != identity or time.monotonic() - pending["created_at"] > 600:
+            pending = begin_google_authorization(config, redirect)
+            pending["identity"] = identity
+            st.session_state["_google_pending"] = pending
+        response = _authorize_button(authorization_url=pending["authorization_url"], name="Connect Google", popup_height=750,
+                                     popup_width=600, key="google_" + pending["id"], use_container_width=True, auto_click=False)
+        st.caption("Sign in and allow read-only access. Keep this app tab open; allow the Google popup if your browser blocks it.")
+        if response:
+            try:
+                with st.spinner("Connecting to Search Console…"):
+                    token = finish_google_authorization(pending, response)
+                    st.session_state["gsc_credentials"] = token
+                    connected, properties = connect_properties(token)
+                    st.session_state["gsc_credentials"] = connected
+                    st.session_state["google_notice"] = f"Loaded {len(properties)} Search Console properties."
+            except Exception as exc:
+                st.session_state["google_notice"] = safe_error(exc)
+            finally:
+                st.session_state.pop("_google_pending", None)
+            st.rerun()
+    elif uploaded:
+        if st.button("Connect Google", key="google_token"):
+            try:
+                with st.spinner("Connecting to Search Console…"):
+                    connected, _ = connect_properties(validate_token_info(uploaded))
+                st.session_state["gsc_credentials"] = connected
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+    else:
+        st.caption("Add google_client_secret_json in Streamlit Secrets once, then use Connect Google here.")
 
 
 def import_html_csv(profile, source):
@@ -2246,10 +2425,12 @@ def main():
     settings = read_json(DATA_DIR / "settings.json", {})
     password = str(secret_value(st, "app_password"))
     secret_token = secret_value(st, "gsc_token_json")
+    secret_client = secret_value(st, "google_client_secret_json") or secret_value(st, "google_client_secret_path")
     profiles = read_json(DATA_DIR / "profiles.json", [])
     legacy_token = DATA_DIR / "auth" / "gsc_token.json"
     has_private_data = any(not p.get("demo") and (client_dir(p) / "gsc_pages.json").exists() for p in profiles)
-    if settings.get("runtime_mode", "hosted") != "local" and not password and (secret_token or legacy_token.exists() or has_private_data):
+    runtime_mode = st.session_state.get("runtime_mode", settings.get("runtime_mode", "hosted"))
+    if runtime_mode != "local" and not password and (secret_client or secret_token or legacy_token.exists() or has_private_data):
         st.title("Internal linking opportunities")
         st.info("Add an app password in Streamlit Secrets before connecting or viewing client Search Console data.")
         st.code('app_password = "choose-a-private-password"', language="toml")
@@ -2273,7 +2454,7 @@ def main():
         except (ValueError, OSError):
             pass
     info = st.session_state.get("gsc_credentials")
-    if not info and secret_token:
+    if not info and secret_token and not st.session_state.get("skip_secret_token"):
         try:
             info = validate_token_info(json.loads(secret_token) if isinstance(secret_token, str) else dict(secret_token))
             st.session_state["gsc_credentials"] = info
@@ -2288,32 +2469,17 @@ def main():
                 profiles = read_json(DATA_DIR / "profiles.json", [])
         except Exception as exc:
             st.warning(safe_error(exc))
-    st.sidebar.caption("One-time connection and optional crawl controls")
+    google_panel = st.sidebar.container()
+    st.sidebar.caption("Optional crawl controls")
     with st.sidebar.expander("Connection & crawl options", expanded=False):
-        runtime = st.selectbox("Run on", ["hosted", "local"], index=0 if settings.get("runtime_mode", "hosted") != "local" else 1,
+        runtime = st.selectbox("Run on", ["hosted", "local"], index=0 if runtime_mode != "local" else 1, key="runtime_mode",
                                format_func=lambda x: "Streamlit Cloud — automatic web crawl" if x == "hosted" else "This computer — Screaming Frog when available")
         settings["runtime_mode"] = runtime
         settings["refresh_crawl"] = st.checkbox("Refresh saved crawl and GSC data", value=False)
         settings["crawl_limit"] = int(st.number_input("Maximum pages per crawl", 100, 20000, int(settings.get("crawl_limit", 2000)), 100))
         if runtime == "local":
             settings["sf_path"] = st.text_input("Screaming Frog CLI path (optional)", settings.get("sf_path", ""))
-        token_upload = st.file_uploader("Google authorized token JSON", type="json", help="Stored in session memory. For persistence, use gsc_token_json in Streamlit Secrets.")
-        if st.button("Connect Google / refresh clients"):
-            try:
-                if runtime == "hosted" and not password:
-                    raise ValueError("Set app_password in Streamlit Secrets before connecting Google.")
-                value = json.loads(token_upload.getvalue()) if token_upload else info
-                if not value:
-                    raise ValueError("Upload your authorized GSC token JSON or configure gsc_token_json in Streamlit Secrets.")
-                local_config = value if runtime == "local" and "installed" in value else None
-                token = None if local_config else validate_token_info(value)
-                with st.spinner("Connecting…"):
-                    connected, _ = connect_properties(token, local_config)
-                st.session_state["gsc_credentials"] = connected
-                atomic_json(DATA_DIR / "settings.json", settings)
-                st.rerun()
-            except Exception as exc:
-                st.error(safe_error(exc))
+        token_upload = st.file_uploader("Google JSON file (optional)", type="json", help="Accepts the downloaded Google client configuration or an existing authorized token. No upload is needed when google_client_secret_json is configured in Secrets.")
         site_url = st.text_input("Add a website without GSC (optional)", placeholder="https://example.com/")
         if st.button("Add website"):
             if url_key(site_url):
@@ -2344,10 +2510,20 @@ def main():
                         st.success("Crawl imported. Click Find opportunities to prepare all results.")
                     except Exception as exc:
                         st.error(safe_error(exc))
+    with google_panel:
+        try:
+            config = load_google_client_config(st, runtime)
+            uploaded = json.loads(token_upload.getvalue().decode("utf-8-sig")) if token_upload else None
+            if isinstance(uploaded, dict) and ("web" in uploaded or "installed" in uploaded):
+                config = validate_google_client_config(uploaded)
+                uploaded = None
+            render_google_connection(st, config, runtime, password, info, uploaded)
+        except (ValueError, ImportError) as exc:
+            st.error(safe_error(exc))
     st.title("Internal linking opportunities")
     st.caption("Blog pages → relevant core pages. Core pages are detected from navigation and footer links.")
     if not profiles:
-        st.info("Connect Google once under Connection & crawl options to load your clients, or add a website there. You can also try the demo.")
+        st.info("Click Connect Google in the sidebar to load your clients. You can also add a website or try the demo under Connection & crawl options.")
         return
     ids = [p["id"] for p in profiles]
     if st.session_state.get("selected_client") not in ids:
