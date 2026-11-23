@@ -53,13 +53,109 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("INTERNAL_LINK_DATA_DIR", str(APP_DIR / "data"))).expanduser().resolve()
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 GOOGLE_CREDENTIALS_INFO = None  # Worker memory only; never included in job JSON.
-GOOGLE_CALLBACK_PATH = "/component/streamlit_oauth.authorize_button/index.html"
+GOOGLE_CALLBACK_BASE = "/component/streamlit_oauth.authorize_button"
+GOOGLE_CALLBACK_PATH = GOOGLE_CALLBACK_BASE + "/index.html"
+GOOGLE_CALLBACK_PATHS = {GOOGLE_CALLBACK_BASE, GOOGLE_CALLBACK_BASE + "/", GOOGLE_CALLBACK_PATH}
 GOOGLE_HTTP_TIMEOUT = 15
 GOOGLE_CONNECT_TIMEOUT = 45
 UA = "CadenceInternalLinks/1.0"
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+GOOGLE_POPUP_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
+<style>
+body { margin:0; font:14px system-ui,sans-serif; }
+button { width:100%; min-height:38px; border:1px solid #ff4b4b; border-radius:8px;
+         background:#ff4b4b; color:white; font:inherit; cursor:pointer; }
+button:disabled { opacity:.6; cursor:wait; }
+#status { margin:7px 0 2px; font-size:12px; line-height:1.4; }
+</style></head><body>
+<button id="connect" type="button">Connect Google</button>
+<p id="status" role="status" aria-live="polite"></p>
+<script>
+(() => {
+  const button = document.getElementById("connect");
+  const status = document.getElementById("status");
+  let args = {}, timer = null;
+  const send = (type, fields = {}) => window.parent.postMessage(
+    {isStreamlitMessage:true, type, ...fields}, "*");
+  const resize = () => send("streamlit:setFrameHeight", {height:Math.max(46, document.body.scrollHeight)});
+  const value = data => send("streamlit:setComponentValue", {value:data, dataType:"json"});
+  // Streamlit Cloud may canonicalize index.html to the component directory.
+  // Accept that alias only at the exact expected origin and callback path.
+  const canonicalPath = path => path.replace(/\/index\.html$/, "/").replace(/\/+$/, "");
+  const finish = (data, message) => {
+    if (timer !== null) window.clearInterval(timer);
+    timer = null;
+    button.disabled = false;
+    status.textContent = message;
+    resize();
+    value(data);
+  };
+  window.addEventListener("message", event => {
+    if (event.source !== window.parent || event.data?.type !== "streamlit:render") return;
+    args = event.data.args || {};
+    button.textContent = args.name || "Connect Google";
+    if (timer === null) button.disabled = Boolean(event.data.disabled);
+    if (event.data.theme) document.body.style.color = event.data.theme.textColor || "inherit";
+    resize();
+  });
+  button.addEventListener("click", () => {
+    if (timer !== null) return;
+    let authorization, expected;
+    try {
+      authorization = new URL(args.authorization_url);
+      expected = new URL(authorization.searchParams.get("redirect_uri"));
+      if (authorization.origin !== "https://accounts.google.com") throw new Error("invalid provider");
+    } catch (_) {
+      finish({_ui_error:"invalid_connection"}, "Restart Google sign-in in the app.");
+      return;
+    }
+    const popup = window.open(authorization.href, "googleSearchConsoleSignIn",
+      "popup=yes,width=600,height=750");
+    if (!popup) {
+      finish({_ui_error:"popup_blocked"}, "Allow this site's popups, then click Connect Google again.");
+      return;
+    }
+    try { popup.focus(); } catch (_) {}
+    button.disabled = true;
+    status.textContent = "Finish Google sign-in in the popup. Keep this app tab open.";
+    resize();
+    const started = Date.now();
+    timer = window.setInterval(() => {
+      if (Date.now() - started > 180000) {
+        finish({_ui_error:"popup_timeout"}, "Google has not returned. Restart sign-in in the app.");
+        return;
+      }
+      try {
+        if (popup.closed) {
+          finish({_ui_error:"popup_closed"}, "The sign-in popup closed before returning. Try again.");
+          return;
+        }
+        const current = new URL(popup.location.href);
+        if (current.origin !== expected.origin || canonicalPath(current.pathname) !== canonicalPath(expected.pathname)) return;
+        const params = current.searchParams;
+        if (!params.has("code") && !params.has("error")) return;
+        const response = {};
+        for (const name of ["code", "state", "error"]) {
+          if (params.has(name)) response[name] = params.get(name);
+        }
+        popup.close();
+        finish(response, "Google returned. Loading your client list…");
+      } catch (error) {
+        // Reading the popup is expected to fail while it is on Google's origin.
+        if (error.name !== "SecurityError") {
+          finish({_ui_error:"popup_unavailable"}, "The browser could not return sign-in to the app. Restart sign-in.");
+        }
+      }
+    }, 500);
+  });
+  window.addEventListener("pagehide", () => { if (timer !== null) window.clearInterval(timer); });
+  send("streamlit:componentReady", {apiVersion:1});
+  resize();
+})();
+</script></body></html>'''
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 STAGES = {
     "crawl": "Run Screaming Frog",
@@ -1911,6 +2007,10 @@ def save_working_profile(profile):
 
 
 def safe_error(exc):
+    if type(exc).__name__ == "InvalidClientError" or getattr(exc, "error", None) == "invalid_client":
+        return "Google rejected the OAuth client credentials (invalid_client). Use client_id and client_secret from the same Web application JSON in Streamlit Secrets, then restart Google sign-in."
+    if type(exc).__name__ == "InvalidGrantError" or getattr(exc, "error", None) == "invalid_grant":
+        return "The Google sign-in code expired or was already used. Click Restart Google sign-in and complete a fresh sign-in."
     current = exc
     seen = set()
     while current is not None and id(current) not in seen:
@@ -2209,13 +2309,13 @@ def google_redirect_uri(st, config, runtime):
         raise ValueError("This is a Desktop OAuth client. For Streamlit Cloud, create a Web application client in Google Cloud, register the return URL, then use its downloaded JSON.")
     redirect = str(secret_value(st, "google_redirect_uri")).strip()
     if not redirect:
-        choices = [u for u in config["web"].get("redirect_uris", []) if isinstance(u, str) and u.endswith(GOOGLE_CALLBACK_PATH)]
+        choices = [u for u in config["web"].get("redirect_uris", []) if isinstance(u, str) and urlsplit(u).path in GOOGLE_CALLBACK_PATHS]
         if len(choices) == 1:
             redirect = choices[0]
     parsed = urlsplit(redirect)
     local = parsed.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
     if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
-            or parsed.path != GOOGLE_CALLBACK_PATH or (parsed.scheme != "https" and not (runtime == "local" and local and parsed.scheme == "http"))
+            or parsed.path not in GOOGLE_CALLBACK_PATHS or (parsed.scheme != "https" and not (runtime == "local" and local and parsed.scheme == "http"))
             or (runtime != "local" and local)):
         raise ValueError("Set google_redirect_uri to your app's HTTPS URL followed by " + GOOGLE_CALLBACK_PATH + ". Register the exact same URL in Google Cloud.")
     return redirect
@@ -2247,6 +2347,34 @@ def finish_google_authorization(pending, response):
     flow.fetch_token(code=code, timeout=GOOGLE_HTTP_TIMEOUT)
     token = validate_token_info(json.loads(flow.credentials.to_json()))
     return token
+
+
+def google_authorize_button(pending):
+    """Popup with canonical callback matching; no secret is sent to the UI."""
+    # Keep the previously registered callback URL working. This import registers
+    # the package's callback asset; our component handles the popup and return.
+    import streamlit_oauth  # noqa: F401
+    from streamlit.components.v1 import declare_component
+    folder = DATA_DIR / "ui" / ("google-sign-in-" + hashlib.sha256(GOOGLE_POPUP_HTML.encode()).hexdigest()[:12])
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / "index.html"
+    if not target.is_file():
+        temporary = folder / (uuid.uuid4().hex + ".tmp")
+        temporary.write_text(GOOGLE_POPUP_HTML, encoding="utf-8")
+        os.replace(temporary, target)
+    popup = declare_component("google_connect", path=str(folder))
+    return popup(authorization_url=pending["authorization_url"], name="Connect Google", key="google_" + pending["id"], default=None)
+
+
+def google_popup_error(response):
+    messages = {
+        "popup_blocked": "Your browser blocked the Google sign-in popup. Allow popups for this app, then click Connect Google again.",
+        "popup_closed": "The Google popup closed before the app received its response. Click Connect Google again.",
+        "popup_timeout": "Google has not returned to this app. Close the previous popup and click Restart Google sign-in.",
+        "popup_unavailable": "The browser could not return Google sign-in to this app. Click Restart Google sign-in.",
+        "invalid_connection": "The Google sign-in could not start. Click Restart Google sign-in.",
+    }
+    return messages.get(response.get("_ui_error"), messages["invalid_connection"])
 
 
 def render_google_connection(st, config, runtime, password, info, uploaded=None):
@@ -2284,9 +2412,6 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
                 st.error(safe_error(exc))
         return
     if config:
-        # This pinned dependency supplies only the popup UI. Google's library
-        # performs the server-side exchange; we enforce mandatory state + PKCE.
-        from streamlit_oauth import _authorize_button
         redirect = google_redirect_uri(st, config, runtime)
         identity = digest({"client_id": config["web"]["client_id"], "redirect": redirect})
         pending = st.session_state.get("_google_pending")
@@ -2294,13 +2419,15 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
             pending = begin_google_authorization(config, redirect)
             pending["identity"] = identity
             st.session_state["_google_pending"] = pending
-        response = _authorize_button(authorization_url=pending["authorization_url"], name="Connect Google", popup_height=750,
-                                     popup_width=600, key="google_" + pending["id"], use_container_width=True, auto_click=False)
+        response = google_authorize_button(pending)
         st.caption("Waiting for Google sign-in. Keep this app tab open. Connecting only loads your client list; no crawl runs yet.")
         if st.button("Restart Google sign-in", key="google_restart"):
             st.session_state.pop("_google_pending", None)
             st.rerun()
         st.caption("If you already approved access but the popup stays open, close that popup and restart sign-in. The return URL in Google Cloud and Streamlit Secrets must match exactly.")
+        if isinstance(response, dict) and response.get("_ui_error"):
+            st.warning(google_popup_error(response))
+            return
         if response:
             try:
                 connected, properties = run_google_connection(st, pending=pending, response=response)
