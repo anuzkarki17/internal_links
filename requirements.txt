@@ -1,4 +1,4 @@
-# Commit this file beside app.py. Recommended runtime: Python 3.11 or 3.12.
+# One-click internal linking app: put beside app.py. Python 3.11 or 3.12 recommended.
 streamlit>=1.53,<2
 pandas>=2.2,<4
 numpy>=1.26,<3
@@ -13,6 +13,8 @@ plotly>=5.24,<8
 google-api-python-client>=2.150,<3
 google-auth>=2.35,<3
 google-auth-oauthlib>=1.2,<2
+# Pinned: supplies the Google sign-in popup; token exchange stays in google-auth-oauthlib.
+streamlit-oauth==0.1.14
 psutil>=5.9,<8
 tzdata>=2024.1
 
