@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import gzip
 import hashlib
 import hmac
@@ -34,6 +35,7 @@ import json
 import math
 import os
 import platform
+import pickle
 import queue
 import re
 import shutil
@@ -44,7 +46,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import date, datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -63,11 +65,15 @@ from filelock import FileLock
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("INTERNAL_LINK_DATA_DIR", str(APP_DIR / "data"))).expanduser().resolve()
-APP_VERSION = "2.3.0"
-INSIGHT_VERSION = "2"
+APP_VERSION = "2.4.0"
+INSIGHT_VERSION = "3"
+CRAWL_SCHEMA = 3
 GOOGLE_CREDENTIALS_INFO = None  # Worker memory only; never included in job JSON.
 IS_WORKER = False
 JSON_SNAPSHOT = ContextVar("internal_link_json_snapshot", default=None)
+UI_READS = ContextVar("internal_link_ui_reads", default=False)
+CLIENT_LOCKS = ContextVar("internal_link_client_locks", default=frozenset())
+HTTP_POOLS = threading.local()
 GOOGLE_CALLBACK_BASE = "/component/streamlit_oauth.authorize_button"
 GOOGLE_CALLBACK_PATH = GOOGLE_CALLBACK_BASE + "/index.html"
 GOOGLE_CALLBACK_PATHS = {GOOGLE_CALLBACK_BASE, GOOGLE_CALLBACK_BASE + "/", GOOGLE_CALLBACK_PATH}
@@ -85,7 +91,7 @@ button { width:100%; min-height:38px; border:1px solid #ff4b4b; border-radius:8p
 button:disabled { opacity:.6; cursor:wait; }
 #status { margin:7px 0 2px; font-size:12px; line-height:1.4; }
 </style></head><body>
-<button id="connect" type="button">Connect Google</button>
+<button id="connect" type="button" disabled>Connect Google</button>
 <p id="status" role="status" aria-live="polite"></p>
 <script>
 (() => {
@@ -96,13 +102,15 @@ button:disabled { opacity:.6; cursor:wait; }
     {isStreamlitMessage:true, type, ...fields}, "*");
   const resize = () => send("streamlit:setFrameHeight", {height:Math.max(46, document.body.scrollHeight)});
   const value = data => send("streamlit:setComponentValue", {value:data, dataType:"json"});
-  // Streamlit Cloud may canonicalize index.html to the component directory.
-  // Accept that alias only at the exact expected origin and callback path.
   const canonicalPath = path => path.replace(/\/index\.html$/, "/").replace(/\/+$/, "");
-  const finish = (data, message) => {
+  const stopTimer = () => {
     if (timer !== null) window.clearInterval(timer);
     timer = null;
+  };
+  const finish = (data, message) => {
+    stopTimer();
     button.disabled = false;
+    button.textContent = args.name || "Connect Google";
     status.textContent = message;
     resize();
     value(data);
@@ -110,13 +118,12 @@ button:disabled { opacity:.6; cursor:wait; }
   window.addEventListener("message", event => {
     if (event.source !== window.parent || event.data?.type !== "streamlit:render") return;
     args = event.data.args || {};
-    button.textContent = args.name || "Connect Google";
-    if (timer === null) button.disabled = Boolean(event.data.disabled);
+    button.textContent = timer === null ? args.name || "Connect Google" : "Open Google again";
+    button.disabled = Boolean(event.data.disabled) || !args.authorization_url;
     if (event.data.theme) document.body.style.color = event.data.theme.textColor || "inherit";
     resize();
   });
   button.addEventListener("click", () => {
-    if (timer !== null) return;
     let authorization, expected;
     try {
       authorization = new URL(args.authorization_url);
@@ -126,25 +133,42 @@ button:disabled { opacity:.6; cursor:wait; }
       finish({_ui_error:"invalid_connection"}, "Restart Google sign-in in the app.");
       return;
     }
-    const popup = window.open(authorization.href, "googleSearchConsoleSignIn",
-      "popup=yes,width=600,height=750");
+    stopTimer();
+    let popup;
+    try {
+      // A fresh ordinary tab avoids hidden/reused floating popup windows.
+      // Keep this call synchronous with the user's click: no server round trip.
+      popup = window.open(authorization.href, "_blank");
+    } catch (_) {
+      finish({_ui_error:"popup_blocked"}, "Use Open Google in a new tab below.");
+      return;
+    }
     if (!popup) {
-      finish({_ui_error:"popup_blocked"}, "Allow this site's popups, then click Connect Google again.");
+      finish({_ui_error:"popup_blocked"}, "Use Open Google in a new tab below.");
       return;
     }
     try { popup.focus(); } catch (_) {}
-    button.disabled = true;
-    status.textContent = "Finish Google sign-in in the popup. Keep this app tab open.";
+    button.disabled = false;
+    button.textContent = "Open Google again";
+    status.textContent = "Google sign-in was requested in a new tab. If it did not open, use the direct link below.";
     resize();
+    value(null); // Clear an earlier UI error without consuming OAuth state.
     const started = Date.now();
+    let prompted = false;
     timer = window.setInterval(() => {
-      if (Date.now() - started > 180000) {
-        finish({_ui_error:"popup_timeout"}, "Google has not returned. Restart sign-in in the app.");
+      const elapsed = Date.now() - started;
+      if (elapsed > 120000) {
+        finish({_ui_error:"popup_timeout"}, "Finish in the Google tab, then use the return-address option below if needed.");
         return;
+      }
+      if (elapsed > 8000 && !prompted) {
+        prompted = true;
+        status.textContent = "If no Google tab appeared, use Open Google in a new tab below. The return-address option can finish sign-in if the browser cannot reconnect automatically.";
+        resize();
       }
       try {
         if (popup.closed) {
-          finish({_ui_error:"popup_closed"}, "The sign-in popup closed before returning. Try again.");
+          finish({_ui_error:"popup_closed"}, "The Google tab closed or was separated by the browser. Use the direct link and return-address option below.");
           return;
         }
         const current = new URL(popup.location.href);
@@ -158,18 +182,18 @@ button:disabled { opacity:.6; cursor:wait; }
         popup.close();
         finish(response, "Google returned. Loading your client list…");
       } catch (error) {
-        // Reading the popup is expected to fail while it is on Google's origin.
         if (error.name !== "SecurityError") {
-          finish({_ui_error:"popup_unavailable"}, "The browser could not return sign-in to the app. Restart sign-in.");
+          finish({_ui_error:"popup_unavailable"}, "Use the return-address option below to finish sign-in.");
         }
       }
     }, 500);
   });
-  window.addEventListener("pagehide", () => { if (timer !== null) window.clearInterval(timer); });
+  window.addEventListener("pagehide", stopTimer);
   send("streamlit:componentReady", {apiVersion:1});
   resize();
 })();
 </script></body></html>'''
+
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 STAGES = {
     "crawl": "Run Screaming Frog",
@@ -186,7 +210,7 @@ AUDITS = {
     "anchors": "Vague / missing contextual anchors",
     "destinations": "Broken / redirected / non-indexable destinations",
 }
-EMPTY_EXCLUSIONS = r"/(?:privacy(?:-policy)?|terms(?:-and-conditions)?|login|cart|checkout|account|search|tag|author)(?:/|$)"
+EMPTY_EXCLUSIONS = r"/(?:privacy(?:-policy)?|terms(?:-and-conditions)?|login|cart|checkout|account|search|tags?|authors?|category|categories|product-category|topics?)(?:/|$)"
 TOKEN_RE = re.compile(r"[\w]+(?:[-’'][\w]+)*", re.UNICODE)
 BAD_EDGE = set("a an the this that these those our your their its for to of in on at by with from and or but as is are was were be been being can could would should will may might how what why when where which who we you they it also more most very such into through than then have has had do does did using use used help helps improve improves including include includes provides provide offers offer".split())
 GENERIC = set("company companies solution solutions service services product products information learn read more here click website page pages business businesses system systems tool tools technology technologies guide best good new support need needs help including provide provides offer offers".split())
@@ -221,6 +245,30 @@ def dataset_snapshot():
         yield
     finally:
         JSON_SNAPSHOT.reset(token)
+
+
+@contextmanager
+def ui_reads():
+    token = UI_READS.set(True)
+    try:
+        yield
+    finally:
+        UI_READS.reset(token)
+
+
+@contextmanager
+def client_transaction(profile, timeout=30):
+    key = str(client_dir(profile))
+    if key in CLIENT_LOCKS.get():
+        yield
+        return
+    client_dir(profile).mkdir(parents=True, exist_ok=True)
+    with FileLock(str(client_dir(profile) / "analysis.guard"), timeout=timeout):
+        token = CLIENT_LOCKS.set(CLIENT_LOCKS.get() | {key})
+        try:
+            yield
+        finally:
+            CLIENT_LOCKS.reset(token)
 
 
 def update_profiles(mutator):
@@ -262,7 +310,7 @@ def atomic_json(path, value, private=False):
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         with temp.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False, default=str)
+            json.dump(value, handle, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
         if private:
             try:
                 temp.chmod(0o600)
@@ -287,11 +335,21 @@ def read_json(path, default=None):
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     if cache is not None and key in cache:
         return cache[key]
+    if cache is None and UI_READS.get() and path.stem in set(INSIGHT_INPUTS + ["result", "audit", "page_summary", "insight_pages", "insight_clusters", "insight_reviews", "explorer_snapshot", "seed_checks", "seed_pages"]):
+        import streamlit as st
+        loader = st.cache_resource(show_spinner=False, max_entries=10)(read_json_resource)
+        return loader(str(path), stat.st_mtime_ns, stat.st_size)
     with path.open(encoding="utf-8") as handle:
         value = json.load(handle)
     if cache is not None:
         cache[key] = value
     return value
+
+
+def read_json_resource(path, stamp, size):
+    """Shared read-only datasets; callers construct their own rows before edits."""
+    with Path(path).open(encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def read_job_lock():
@@ -308,7 +366,23 @@ def client_dir(profile):
 
 
 def save_dataset(profile, name, rows, **meta):
-    atomic_json(client_dir(profile) / f"{name}.json", {"meta": {"created_at": utc_now(), "app_version": APP_VERSION, **meta}, "rows": rows})
+    metadata = {"created_at": utc_now(), "app_version": APP_VERSION, **meta}
+    atomic_json(client_dir(profile) / f"{name}.json", {"meta": metadata, "rows": rows})
+    path = client_dir(profile) / f"{name}.json"
+    stat = path.stat()
+    atomic_json(client_dir(profile) / f"{name}.meta.json", {"meta": metadata, "rows": len(rows), "stamp": [stat.st_mtime_ns, stat.st_size]})
+
+
+def dataset_meta(profile, name):
+    path = client_dir(profile) / f"{name}.json"
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {}
+    sidecar = read_json(client_dir(profile) / f"{name}.meta.json", {})
+    if sidecar.get("stamp") == [stat.st_mtime_ns, stat.st_size]:
+        return sidecar.get("meta", {})
+    return dataset(profile, name)["meta"]
 
 
 def dataset(profile, name):
@@ -329,7 +403,10 @@ def input_signature(profile, names):
             stamps[name] = cache[key]
         else:
             with path.open("rb") as handle:
-                stamps[name] = hashlib.file_digest(handle, "sha256").hexdigest()
+                checksum = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    checksum.update(chunk)
+                stamps[name] = checksum.hexdigest()
             if cache is not None:
                 cache[key] = stamps[name]
     return digest({"profile": profile, "datasets": stamps})
@@ -382,6 +459,8 @@ def is_blog(url, profile):
 
 
 def excluded(url, profile):
+    if re.search(r"/(?:category|categories|product-category|tags?|topics?|authors?)(?:/|$)",urlsplit(url).path,re.I):
+        return True
     return bool(profile.get("exclude_pattern") and re.search(profile["exclude_pattern"], urlsplit(url).path, re.I))
 
 
@@ -429,15 +508,18 @@ def validate_profile(profile):
 
 
 def aliases_for(pages, profile):
-    mapping = {}
+    mapping, page_map = {}, {url_key(p["url"]): p for p in pages}
     for p in pages:
-        url = url_key(p["url"])
-        redirect = url_key(p.get("redirect", ""))
-        canonical = url_key(p.get("canonical", ""))
-        if 300 <= int(p.get("status") or 0) < 400 and same_site(redirect, profile):
-            mapping[url] = redirect
-        elif "canonical" in p.get("indexability_status", "").lower() and not p.get("indexable") and same_site(canonical, profile) and canonical != url:
-            mapping[url] = canonical
+        url, target = url_key(p["url"]), url_key(p.get("redirect", ""))
+        if 300 <= int(p.get("status") or 0) < 400 and same_site(target, profile):
+            mapping[url] = target
+    for p in pages:
+        url, canonical = url_key(p["url"]), url_key(p.get("canonical", ""))
+        if canonical and canonical != url and same_site(canonical, profile) and not p.get("indexable") and "canonical" in p.get("indexability_status", "").lower():
+            final = resolve_alias(canonical, mapping)
+            target = page_map.get(final, {})
+            if target.get("status") == 200 and target.get("html") and target.get("indexable"):
+                mapping[url] = final
     return mapping
 
 
@@ -644,6 +726,73 @@ def validate_public_url(url):
     return [str(a) for a in addresses]
 
 
+def crawl_pool(scheme, hostname, port, address):
+    import requests
+    import urllib3
+    pools = getattr(HTTP_POOLS, "pools", None)
+    if pools is None:
+        pools = HTTP_POOLS.pools = OrderedDict()
+    key = scheme, hostname, port, address
+    if key in pools:
+        pools.move_to_end(key)
+        return pools[key]
+    if scheme == "https":
+        pool = urllib3.HTTPSConnectionPool(address, port=port, server_hostname=hostname, assert_hostname=hostname,
+                                           cert_reqs="CERT_REQUIRED", ca_certs=requests.certs.where(), retries=False)
+    else:
+        pool = urllib3.HTTPConnectionPool(address, port=port, retries=False)
+    pools[key] = pool
+    while len(pools) > 8:
+        _, old = pools.popitem(last=False)
+        old.close()
+    return pool
+
+
+def close_crawl_pools():
+    for pool in getattr(HTTP_POOLS, "pools", {}).values():
+        pool.close()
+    HTTP_POOLS.pools = OrderedDict()
+    session = getattr(HTTP_POOLS, "proxy_session", None)
+    if session is not None:
+        session.close()
+        del HTTP_POOLS.proxy_session
+
+
+def proxy_bytes(url, max_bytes):
+    """Operator opt-in for a trusted corporate proxy on a local installation.
+
+    The proxy, not this process, resolves the final peer and must enforce its
+    private-network policy. Hosted mode never accepts this configuration.
+    """
+    import requests
+    session = getattr(HTTP_POOLS, "proxy_session", None)
+    if session is None:
+        session = HTTP_POOLS.proxy_session = requests.Session()
+    current, first, deadline = url_key(url), None, time.monotonic() + 120
+    for _ in range(7):
+        validate_public_url(current)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Website response exceeded the download time limit.")
+        with session.get(current, headers={"User-Agent": UA}, allow_redirects=False, stream=True, timeout=(min(10, remaining), min(35, remaining))) as response:
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            if response.status_code in {301, 302, 303, 307, 308} and headers.get("location"):
+                first = first or response.status_code
+                current = url_key(urljoin(current, headers["location"]))
+                continue
+            data = bytearray()
+            for chunk in response.iter_content(65536):
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise ValueError(f"Response exceeded the {max_bytes:,}-byte limit.")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Website response exceeded the download time limit.")
+            if first:
+                headers["__redirect_status__"] = str(first)
+            return response.status_code, headers, current, bytes(data)
+    raise ValueError("The website returned too many redirects.")
+
+
 def get_bytes(url, max_bytes=5_000_000):
     """Pin each hop to validated IPs, retaining TLS hostname checks and SNI.
 
@@ -652,7 +801,9 @@ def get_bytes(url, max_bytes=5_000_000):
     """
     import requests
     import urllib3
-    current, first_redirect = url_key(url), None
+    if deployment_mode() == "local" and os.environ.get("INTERNAL_LINK_TRUST_PROXY") == "1":
+        return proxy_bytes(url, max_bytes)
+    current, first_redirect, deadline = url_key(url), None, time.monotonic() + 120
     for _ in range(7):
         addresses = validate_public_url(current)
         parts = urlsplit(current)
@@ -664,23 +815,22 @@ def get_bytes(url, max_bytes=5_000_000):
         target = requests.utils.requote_uri(urlunsplit(("", "", parts.path or "/", parts.query, "")))
         last_error = None
         for address in addresses[:4]:
-            kwargs = {"port": parts.port or default_port, "timeout": urllib3.Timeout(connect=10, read=35), "retries": False}
-            if parts.scheme == "https":
-                pool = urllib3.HTTPSConnectionPool(address, server_hostname=hostname, assert_hostname=hostname,
-                                                   cert_reqs="CERT_REQUIRED", ca_certs=requests.certs.where(), **kwargs)
-            else:
-                pool = urllib3.HTTPConnectionPool(address, **kwargs)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Website response exceeded the download time limit.")
+            pool = crawl_pool(parts.scheme, hostname, parts.port or default_port, address)
             response = None
             try:
                 response = pool.urlopen("GET", target, headers={"Host": host_header, "User-Agent": UA, "Accept-Encoding": "gzip, deflate"},
-                                        redirect=False, assert_same_host=False, preload_content=False)
+                                        redirect=False, assert_same_host=False, preload_content=False,
+                                        timeout=urllib3.Timeout(connect=min(10, remaining), read=min(35, remaining)))
                 headers = {k.lower(): v for k, v in response.headers.items()}
                 status = response.status
                 if status in {301, 302, 303, 307, 308} and headers.get("location"):
                     first_redirect = first_redirect or status
                     current = url_key(urljoin(current, headers["location"]))
                     break
-                data, deadline = bytearray(), time.monotonic() + 120
+                data = bytearray()
                 for part in response.stream(65536, decode_content=True):
                     data.extend(part)
                     if len(data) > max_bytes:
@@ -690,14 +840,16 @@ def get_bytes(url, max_bytes=5_000_000):
                 if first_redirect:
                     headers["__redirect_status__"] = str(first_redirect)
                 return status, headers, current, bytes(data)
+            except (TimeoutError, urllib3.exceptions.TimeoutError) as exc:
+                raise TimeoutError("Website request timed out; it was not retried on other IP addresses.") from exc
             except (urllib3.exceptions.HTTPError, OSError) as exc:
                 last_error = exc
             finally:
                 if response is not None:
                     response.close()
-                pool.close()
         else:
-            raise OSError("Could not download the website from its approved public addresses.") from last_error
+            detail = f" ({type(last_error).__name__}: {str(last_error)[:200]})" if last_error else ""
+            raise OSError("Could not download the website from its approved public addresses" + detail) from last_error
     raise ValueError("The website returned too many redirects.")
 
 
@@ -729,37 +881,86 @@ def main_element(soup, selector=""):
     return (soup.find("main") or soup.find(attrs={"role": "main"}) or soup.find("article") or soup.body)
 
 
-def region_of(element, main):
-    """Shared, non-mutating region test for both edges and candidate paragraphs."""
-    inside_main = main is not None and main.name in {"body", "html", "[document]"}
-    for node in [element, *element.parents]:
-        if node.name in {"body", "html", "[document]"}:
-            break
-        if node is main:
-            inside_main = True
-        tokens = {str(c).lower() for c in node.get("class", [])}
-        tokens.add(str(node.get("id", "")).lower())
-        role = str(node.get("role", "")).lower()
-        # Check specific non-editorial widgets before a surrounding navigation.
-        if tokens & BREADCRUMB_TOKENS or str(node.get("aria-label", "")).lower() in {"breadcrumb", "breadcrumbs"}:
-            return "Breadcrumb"
-        if tokens & RELATED_TOKENS:
-            return "Related posts"
-        if node.name == "footer" or role == "contentinfo" or tokens & FOOTER_TOKENS:
-            return "Footer"
-        if node.name in {"nav", "header"} or role in {"navigation", "menubar", "banner"} or tokens & (NAV_TOKENS | HEADER_TOKENS):
-            return "Navigation"
-        if node.name == "aside" or role == "complementary" or tokens & SIDEBAR_TOKENS:
-            return "Sidebar"
-        if node.name in {"script", "style", "noscript", "svg", "template", "iframe", "form", "button", "select", "textarea"} or role in {"search", "dialog"} or node.has_attr("hidden") or str(node.get("aria-hidden", "")).lower() == "true" or tokens & OTHER_TOKENS:
-            return "Other"
-    return "Content" if inside_main else "Other"
+def region_of(element, main, cache=None):
+    """Memoized ancestry. Article header/footer metadata is not site navigation."""
+    if element is None:
+        return "Other"
+    key = id(element)
+    if cache is not None and key in cache:
+        return cache[key]
+    def classify():
+        inside_main = main is not None and (element is main or any(p is main for p in element.parents))
+        lineage = [node for node in [element, *element.parents] if node.name not in {"body", "html", "[document]"}]
+        global_footer = False
+        for node in lineage:
+            tokens = {str(c).lower() for c in node.get("class", [])}
+            role = str(node.get("role", "")).lower()
+            kind = str(node.get("data-elementor-type", "")).lower()
+            explicit_site = role in {"banner", "contentinfo"} or kind in {"header", "footer"} or bool(tokens & {"site-header", "global-header", "site-footer", "global-footer", "elementor-location-header", "elementor-location-footer"})
+            editorial = node.find_parent("article") is not None or (main is not None and main.name not in {"body", "html", "[document]"} and node is not main and any(p is main for p in node.parents))
+            if node.name in {"header", "footer"} and editorial and not explicit_site:
+                return "Other"
+            if kind == "popup":
+                return "Other"
+            if role == "contentinfo" or kind == "footer" or (node.name == "footer" and not editorial) or tokens & {"site-footer", "global-footer", "elementor-location-footer"}:
+                global_footer = True
+        for node in lineage:
+            if node.name in {"body", "html", "[document]"}:
+                break
+            tokens = {str(c).lower() for c in node.get("class", [])}
+            tokens.add(str(node.get("id", "")).lower())
+            role = str(node.get("role", "")).lower()
+            kind = str(node.get("data-elementor-type", "")).lower()
+            site_header = role == "banner" or kind == "header" or bool(tokens & {"site-header", "global-header", "masthead", "elementor-location-header"})
+            site_footer = role == "contentinfo" or kind == "footer" or bool(tokens & {"site-footer", "global-footer", "colophon", "elementor-location-footer"})
+            if tokens & BREADCRUMB_TOKENS or str(node.get("aria-label", "")).lower() in {"breadcrumb", "breadcrumbs"}:
+                return "Breadcrumb"
+            if tokens & RELATED_TOKENS:
+                return "Related posts"
+            # Body fallback is not an editorial main landmark. A header nested
+            # inside an actual article remains post metadata even on such themes.
+            post_container = node.find_parent("article")
+            editorial_main = main is not None and main.name not in {"body", "html", "[document]"}
+            if node.name in {"header", "footer"} and not (site_header or site_footer) and (post_container is not None or (inside_main and editorial_main and node is not main)):
+                return "Other"
+            if site_footer or node.name == "footer" or tokens & FOOTER_TOKENS:
+                return "Footer"
+            if site_header or node.name in {"nav", "header"} or role in {"navigation", "menubar"} or tokens & (NAV_TOKENS | HEADER_TOKENS):
+                return "Footer" if global_footer else "Navigation"
+            if node.name == "aside" or role == "complementary" or tokens & SIDEBAR_TOKENS:
+                return "Sidebar"
+            if node.name in {"script", "style", "noscript", "svg", "template", "iframe", "form", "button", "select", "textarea"} or role in {"search", "dialog"} or node.has_attr("hidden") or str(node.get("aria-hidden", "")).lower() == "true" or tokens & OTHER_TOKENS:
+                return "Other"
+        return "Content" if inside_main else "Other"
+    result = classify()
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
-def extract_content(html, url, selector="", soup=None):
-    """Read the original DOM without deleting siblings or reparsing paragraphs."""
-    from bs4 import BeautifulSoup, NavigableString, Comment
+TEXT_BLOCKS = set(BLOCK_TAGS + ["div", "section", "article", "main", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "table", "tr", "dl"])
+
+
+def visible_parts(element, main, regions):
+    """Keep inline adjacency (invoice<strong>s</strong>), separate real blocks."""
+    from bs4 import NavigableString, Comment, Tag
+    for node in element.descendants:
+        if isinstance(node, Comment):
+            continue
+        if isinstance(node, Tag):
+            if node.name == "a":
+                yield "", True
+            if node.name == "br" or node.name in TEXT_BLOCKS:
+                yield " ", False
+            continue
+        if isinstance(node, NavigableString) and region_of(node.parent, main, regions) == "Content":
+            yield str(node), node.find_parent("a") is not None
+
+
+def extract_content(html, url, selector="", soup=None, regions=None):
+    from bs4 import BeautifulSoup
     soup = soup if soup is not None else BeautifulSoup(html, "lxml")
+    regions = {} if regions is None else regions
     title = text_norm(soup.title.get_text(" ", strip=True)) if soup.title else ""
     h1 = text_norm(soup.h1.get_text(" ", strip=True)) if soup.h1 else ""
     canonical_tag = soup.find("link", rel=lambda value: value and "canonical" in value)
@@ -767,37 +968,32 @@ def extract_content(html, url, selector="", soup=None):
     robots = " ".join(t.get("content", "") for t in soup.find_all("meta", attrs={"name": re.compile(r"^(robots|googlebot)$", re.I)}))
     main = main_element(soup, selector)
     if main is None:
-        return {"success": False, "error": "Main content selector did not match.", "paragraphs": [], "text": "", "title": title, "h1": h1, "canonical": canonical,
+        if selector:
+            raise ValueError("The saved main-content selector did not match this page. Clear or correct it before analyzing content.")
+        return {"success": False, "error": "No main content container.", "paragraphs": [], "text": "", "title": title, "h1": h1, "canonical": canonical,
                 "noindex": bool(re.search(r"\b(?:noindex|none)\b", robots, re.I))}
-    headings = [text_norm(x.get_text(" ", strip=True)) for x in main.find_all(["h1", "h2", "h3"]) if region_of(x, main) == "Content"]
-    outgoing = [url_key(urljoin(url, a.get("href", ""))) for a in main.find_all("a", href=True) if region_of(a, main) == "Content"]
+    headings = [text_norm("".join(t for t, _ in visible_parts(x, main, regions))) for x in main.find_all(["h1", "h2", "h3"]) if region_of(x, main, regions) == "Content"]
+    outgoing = [url_key(urljoin(url, a.get("href", ""))) for a in main.find_all("a", href=True) if region_of(a, main, regions) == "Content"]
     paragraphs = []
     for block in main.find_all(BLOCK_TAGS):
-        if block.find(BLOCK_TAGS) or block.find_parent("a") is not None or region_of(block, main) != "Content":
+        if block.find(BLOCK_TAGS) or block.find_parent("a") is not None or region_of(block, main, regions) != "Content":
             continue
         visible, segments, current = [], [], []
-        for node in block.descendants:
-            if not isinstance(node, NavigableString) or isinstance(node, Comment):
-                continue
-            if node.parent.name in {"script", "style", "noscript"} or region_of(node.parent, main) != "Content":
-                continue
-            value = str(node)
+        for value, linked in visible_parts(block, main, regions):
             visible.append(value)
-            if node.find_parent("a") is not None:
+            if linked:
                 if current:
-                    segments.append(text_norm(" ".join(current)))
+                    segments.append(text_norm("".join(current)))
                     current = []
             else:
                 current.append(value)
         if current:
-            segments.append(text_norm(" ".join(current)))
-        paragraph = text_norm(" ".join(visible))
+            segments.append(text_norm("".join(current)))
+        paragraph = text_norm("".join(visible))
         if len(paragraph.split()) < 7:
             continue
-        paragraphs.append({"text": paragraph, "unlinked": [s for s in segments if s], "locator": css_path(block), "block": len(paragraphs) + 1})
-    # Retain editorial prose/headings for topic inference, excluding page chrome.
-    body = text_norm(" ".join(str(n) for n in main.descendants if isinstance(n, NavigableString) and not isinstance(n, Comment)
-                    and n.parent.name not in {"script", "style", "noscript"} and region_of(n.parent, main) == "Content"))
+        paragraphs.append({"text": paragraph, "unlinked": [v for v in segments if v], "locator": css_path(block), "block": len(paragraphs) + 1})
+    body = text_norm("".join(t for t, _ in visible_parts(main, main, regions)))
     return {"success": bool(body), "error": "" if body else "No extractable body text.", "title": title, "h1": h1,
             "headings": headings, "text": body, "paragraphs": paragraphs, "outgoing_content": sorted(set(filter(None, outgoing))),
             "canonical": canonical, "noindex": bool(re.search(r"\b(?:noindex|none)\b", robots, re.I))}
@@ -950,7 +1146,7 @@ def discover_sitemaps(profile, options, log, check_cancel):
     log(f"Discovered {len(found):,} URLs from {len(seen):,} sitemap requests.")
 
 
-CORE_SKIP = re.compile(r"^/(?:about(?:-us)?|our-company|our-team|company|contact(?:-us|-sales)?|support|help(?:-center)?|faq|faqs|careers?|jobs?|work-for-us|team|privacy(?:-policy)?|terms(?:-of-service)?|legal|cookies?(?:-policy)?|login|logout|sign-in|sign-up|signup|account|cart|checkout|search|tag|tags|authors?|categories|blog(?:-category|-categories)?|blogs|articles|insights|news|resources|case-studies|customer-stories|testimonials|webinars|docs|documentation|developers|api-status|sitemap|accessibility|request(?:-a)?-demo|book-a-demo)(?:/|$)", re.I)
+CORE_SKIP = re.compile(r"^/(?:about(?:-us)?|our-company|our-team|company|contact(?:-us|-sales)?|support|help(?:-center)?|faq|faqs|careers?|jobs?|work-for-us|team|privacy(?:-policy)?|terms(?:-of-service)?|legal|cookies?(?:-policy)?|login|logout|sign-in|sign-up|signup|account|cart|checkout|search|tag|tags|authors?|category|categories|product-category|topics?|pricing|partners?|events?|press|blog(?:-category|-categories)?|blogs|articles|insights|news|resources|case-studies|customer-stories|testimonials|webinars|docs|documentation|developers|api-status|sitemap|gdpr|table-of-processors|accessibility|become-a-partner|blueprint-collective|product-videos|guides|videos|request(?:-a)?-demo|book-a-demo)(?:/|$)", re.I)
 BINARY_PATH = re.compile(r"\.(?:jpe?g|png|webp|gif|svg|ico|css|js|map|pdf|zip|gz|xml|mp4|mov|mp3|woff2?|ttf|eot|xlsx?|docx?|csv)(?:$|\?)", re.I)
 
 
@@ -959,30 +1155,36 @@ def page_from_html(raw, url, profile, headers=None):
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(raw, "lxml")
     headers = headers or {}
-    extracted = extract_content(raw, url, profile.get("main_selector", ""), soup=soup)
+    regions = {}
+    extracted = extract_content(raw, url, profile.get("main_selector", ""), soup=soup, regions=regions)
     noindex = extracted.get("noindex", False) or bool(re.search(r"\bnoindex\b", headers.get("x-robots-tag", ""), re.I))
     canonical = extracted.get("canonical") or url
     page = {"url": url, "status": 200, "html": True, "content_type": "text/html", "title": extracted.get("title", ""),
             "h1": extracted.get("h1", ""), "canonical": canonical, "redirect": "", "source_nofollow": False,
             "indexable": not noindex and canonical == url, "indexability_status": "noindex" if noindex else "Canonicalised" if canonical != url else ""}
     robots = " ".join(t.get("content", "") for t in soup.find_all("meta", attrs={"name": re.compile(r"^(robots|googlebot)$", re.I)}))
-    page["source_nofollow"] = bool(re.search(r"\bnofollow\b", robots + " " + headers.get("x-robots-tag", ""), re.I))
+    page["source_nofollow"] = bool(re.search(r"\b(?:nofollow|none)\b", robots + " " + headers.get("x-robots-tag", ""), re.I))
     ogtype = soup.find("meta", attrs={"property": "og:type"})
     schema_text = " ".join(t.get_text() for t in soup.find_all("script", attrs={"type": "application/ld+json"}))
-    article = (bool(ogtype and ogtype.get("content", "").lower() == "article") or bool(re.search(r'"(?:BlogPosting|NewsArticle|Article)"', schema_text)))
-    page["article"] = article or is_blog(url, profile)
+    body_classes = {str(v).lower() for v in (soup.body.get("class", []) if soup.body else [])}
+    wordpress_page = "page" in body_classes and "single-post" not in body_classes
+    post_schema = bool(re.search(r'"(?:BlogPosting|NewsArticle)"', schema_text))
+    post_classes = bool(body_classes & {"single-post", "type-post", "post-template-default"})
+    # Yoast uses og:type=article for ordinary WordPress solution/product pages.
+    # That tag alone cannot classify a business page as a blog post.
+    page["article"] = is_blog(url, profile) or post_classes or (post_schema and not wordpress_page)
     edges = []
     main = main_element(soup, profile.get("main_selector", ""))
     for anchor in soup.find_all("a", href=True):
         destination = url_key(urljoin(url, anchor["href"]))
         if not same_site(destination, profile):
             continue
-        position = region_of(anchor, main)
+        position = region_of(anchor, main, regions)
         image = anchor.find("img")
-        edges.append({"source": url, "destination": destination, "anchor": text_norm(anchor.get_text(" ", strip=True)),
+        edges.append({"source": url, "destination": destination, "anchor": text_norm(anchor.get_text("", strip=False)),
                       "alt": image.get("alt", "") if image else "", "position": position, "position_known": True,
                       "contextual": position == "Content", "type": "Hyperlink", "locator": css_path(anchor) if position == "Content" else "",
-                      "followable": "nofollow" not in anchor.get("rel", []) and not page["source_nofollow"]})
+                      "followable": "nofollow" not in {str(r).lower() for r in anchor.get("rel", [])} and not page["source_nofollow"]})
     org_names = []
     site_name = soup.find("meta", attrs={"property": "og:site_name"})
     if site_name and 1 <= len(text_norm(site_name.get("content", "")).split()) <= 5:
@@ -1032,47 +1234,68 @@ def detect_proprietary_product_brands(profile, rows):
         automatic_brand_terms(profile, terms)
 
 
+TAXONOMY_PATH = re.compile(r"/(?:category|categories|product-category|tags?|topics?|authors?)(?:/|$)", re.I)
+BUSINESS_PATH = re.compile(r"/(?:solutions?|services?|products?|platform|features?|industr(?:y|ies)|use-cases?|for-(?:architects?|engineers?|business|finance|operations|project))(?=/|[-_]|$)", re.I)
+
+
+def core_settings(profile):
+    value = read_json(client_dir(profile) / "core_settings.json", {})
+    return {"include": list(dict.fromkeys(url_key(u) for u in value.get("include", []) if same_site(u, profile))),
+            "exclude": list(dict.fromkeys(url_key(u) for u in value.get("exclude", []) if same_site(u, profile)))}
+
+
+def destination_issue(page):
+    if not page:
+        return "Not crawled yet"
+    if page.get("status") != 200 or not page.get("html"):
+        return "HTTP " + str(page.get("status") or "unverified")
+    if not page.get("indexable"):
+        if page.get("canonical") and page["canonical"] != page["url"]:
+            return "Canonical points to " + page["canonical"]
+        return page.get("indexability_status") or "Not indexable"
+    return "Eligible"
+
+
 def infer_core_pages(profile, pages, links, strict=True):
+    """Business identity is separate from automatic link/indexability eligibility."""
+    profile_view = PreparedProfile(profile)
     page_map = {p["url"]: p for p in pages}
     aliases = aliases_for(pages, profile)
-    candidates = {}
+    choices = core_settings(profile)
+    omitted = {resolve_alias(u, aliases) for u in choices["exclude"]}
+    candidates, evidence = {}, defaultdict(set)
     for link in links:
-        position = link.get("position", "").lower()
-        if not any(term in position for term in ["nav", "header", "footer"]):
-            continue
         u = resolve_alias(link["destination"], aliases)
-        if not u or not same_site(u, profile) or is_home(u, profile) or is_blog(u, profile) or excluded(u, profile) or CORE_SKIP.search(urlsplit(u).path) or BINARY_PATH.search(u):
+        position = str(link.get("position", "")).lower()
+        if any(t in position for t in ["nav", "header", "footer"]):
+            evidence[u].add("Navigation" if any(t in position for t in ["nav", "header"]) else "Footer")
+    # Business URL structure backs up non-semantic templates; never include every
+    # repeated article/sidebar link or every non-blog page by default.
+    for page in pages:
+        if BUSINESS_PATH.search(urlsplit(page["url"]).path):
+            evidence[page["url"]].add("Business-page path")
+    for u, places in evidence.items():
+        if (not u or not same_site(u, profile) or is_home(u, profile) or u in omitted or TAXONOMY_PATH.search(urlsplit(u).path)
+                or is_blog(u, profile_view) or excluded(u, profile) or CORE_SKIP.search(urlsplit(u).path) or BINARY_PATH.search(u)):
             continue
-        p = page_map.get(u)
-        if strict and (not p or not p.get("indexable") or p.get("status") != 200 or not p.get("html")):
+        page = page_map.get(u)
+        if strict and (not page or page.get("status") != 200 or not page.get("html")):
             continue
-        topic = without_brand(p.get("h1") or p.get("title") or link.get("anchor") or urlsplit(u).path.replace("-", " "), profile) if p else without_brand(link.get("anchor") or urlsplit(u).path.replace("-", " "), profile)
-        priority = 5 if any(term in position for term in ["nav", "header"]) else 3
-        if u not in candidates or candidates[u]["priority"] < priority:
-            candidates[u] = {"url": u, "topic": topic, "priority": priority, "detected_from": "Navigation" if priority == 5 else "Footer"}
-    if not candidates and pages:
-        # Some themes render menus without semantic nav/footer landmarks.
-        # Repeated destinations are a fallback, explicitly labeled as inferred.
-        repeated = defaultdict(set)
-        for link in links:
-            # Repeated article/sidebar/related-post links do not establish a
-            # commercial core page. This fallback is for unlabeled chrome only.
-            if link.get("position_known") and link.get("position") != "Other":
-                continue
-            repeated[resolve_alias(link["destination"], aliases)].add(link["source"])
-        minimum = max(2, math.ceil(len(pages) * .2))
-        for u, sources in repeated.items():
-            p = page_map.get(u, {})
-            if len(sources) >= minimum and p.get("indexable") and p.get("status") == 200 and same_site(u, profile) and not is_home(u, profile) and not is_blog(u, profile) and not excluded(u, profile) and not CORE_SKIP.search(urlsplit(u).path):
-                candidates[u] = {"url": u, "topic": without_brand(p.get("h1") or p.get("title") or urlsplit(u).path, profile), "priority": 3, "detected_from": "Repeated site link (inferred)"}
-    # Retain explicit choices, never stale auto-detected navigation candidates.
+        label = (page or {}).get("h1") or (page or {}).get("title") or urlsplit(u).path.replace("-", " ")
+        candidates[u] = {"url": u, "topic": without_brand(label, profile), "priority": 5 if "Navigation" in places else 3,
+                         "origin": "auto", "detected_from": "; ".join(sorted(places)), "eligibility": destination_issue(page)}
+    manual = list(choices["include"])
     for core in profile.get("core_pages", []):
-        if core.get("origin") != "manual" and core.get("detected_from") not in {None, "", "Saved priority page", "User-selected priority page"}:
+        if core.get("origin") == "manual" or core.get("detected_from") in {None, "", "Saved priority page", "User-selected priority page"}:
+            manual.append(core["url"])
+    for raw in manual:
+        u = resolve_alias(raw, aliases)
+        if not same_site(u, profile) or is_home(u, profile) or u in omitted or TAXONOMY_PATH.search(urlsplit(u).path) or BINARY_PATH.search(u):
             continue
-        u = resolve_alias(core["url"], aliases)
-        p = page_map.get(u)
-        if same_site(u, profile) and not is_home(u, profile) and (not strict or (p and p.get("indexable") and p.get("status") == 200)) and not CORE_SKIP.search(urlsplit(u).path):
-            candidates.setdefault(u, {**core, "url": u, "origin": "manual", "detected_from": "User-selected priority page"})
+        page = page_map.get(u, {})
+        old = next((c for c in profile.get("core_pages", []) if resolve_alias(c["url"], aliases) == u), {})
+        candidates[u] = {"url": u, "topic": without_brand(page.get("h1") or page.get("title") or old.get("topic") or urlsplit(u).path.replace("-", " "), profile),
+                         "priority": old.get("priority", 4), "origin": "manual", "detected_from": "User-selected priority page", "eligibility": destination_issue(page)}
     profile["core_pages"] = sorted(candidates.values(), key=lambda c: (-c["priority"], c["url"]))
     return profile["core_pages"]
 
@@ -1107,17 +1330,21 @@ def built_in_crawl(profile, options, log, check_cancel, homepage=None):
             try:
                 code, _, _, body = get_bytes(origin + "/robots.txt", 1_000_000)
                 parser.parse(body.decode("utf-8", errors="replace").splitlines() if code == 200 else ["User-agent: *", "Disallow:" if code in {404, 410} else "Disallow: /"])
+                if code not in {200,404,410}:
+                    parser.unavailable_reason = f"robots.txt returned HTTP {code}"
             except Cancelled:
                 raise
-            except Exception:
+            except Exception as exc:
                 parser.parse(["User-agent: *", "Disallow: /"])
+                parser.unavailable_reason = type(exc).__name__
             robot_cache[origin] = parser
         return robot_cache[origin]
 
     def fetch(u, parser):
         check_cancel()
         if not parser.can_fetch(UA, u):
-            return u, None, "Blocked by robots.txt (or robots.txt unavailable)."
+            reason = getattr(parser,"unavailable_reason","")
+            return u, None, "Robots rules unavailable: "+reason if reason else "Blocked by robots.txt."
         delay = max(.35, float(parser.crawl_delay(UA) or parser.crawl_delay("*") or 0))
         with rate_lock:
             while time.monotonic() < last_request[0] + delay:
@@ -1135,8 +1362,8 @@ def built_in_crawl(profile, options, log, check_cancel, homepage=None):
         check_cancel()
         counters["checked"] += 1
         if error or response is None:
-            pages[u] = {"url": u, "status": 0, "html": False, "indexable": False, "indexability_status": error, "title": "", "h1": "", "canonical": "", "redirect": ""}
-            counters["failed"] += 1
+            pages[u] = {"url": u, "status": 0, "html": False, "indexable": False, "indexability_status": error, "robots_blocked": error.startswith("Blocked by robots.txt"), "fetch_error": not error.startswith("Blocked by robots.txt"), "title": "", "h1": "", "canonical": "", "redirect": ""}
+            counters["robots_blocked" if error.startswith("Blocked by robots.txt") else "failed"] += 1
             return
         status, headers, final, raw = response
         final = url_key(final)
@@ -1149,8 +1376,10 @@ def built_in_crawl(profile, options, log, check_cancel, homepage=None):
             if final in pages or final in in_flight:
                 return
         if status != 200 or "html" not in headers.get("content-type", "").lower():
-            if status >= 400:
+            if status == 429 or status >= 500:
                 counters["failed"] += 1
+            elif status >= 400:
+                counters["http_errors"] += 1
             pages[final] = {"url": final, "status": status, "html": "html" in headers.get("content-type", ""), "indexable": False, "indexability_status": f"HTTP {status}", "title": "", "h1": "", "canonical": "", "redirect": ""}
             return
         page, edges, body, _ = page_from_html(raw, final, profile, headers)
@@ -1210,8 +1439,8 @@ def built_in_crawl(profile, options, log, check_cancel, homepage=None):
     remaining = {u for _, u in queue if u not in pages}
     partial = bool(remaining)
     metadata = dict(source="Built-in HTML crawl", generation=generation, partial=partial, crawl_limit=limit,
-                    checked=counters["checked"], failed=counters["failed"], remaining=len(remaining), root=profile["root_url"],
-                    crawl_schema=2, classifier_version=2, failure_ratio=counters["failed"] / max(1, counters["checked"]))
+                    checked=counters["checked"], failed=counters["failed"], robots_blocked=counters["robots_blocked"], http_errors=counters["http_errors"], remaining=len(remaining), root=profile["root_url"],
+                    crawl_schema=CRAWL_SCHEMA, classifier_version=CRAWL_SCHEMA, failure_ratio=counters["failed"] / max(1, counters["checked"]))
     save_dataset(profile, "pages", list(pages.values()), **metadata)
     save_dataset(profile, "links", links, links_verified=True, position_available=True, warnings=[], **metadata)
     save_dataset(profile, "content", list(content.values()), **metadata)
@@ -1470,7 +1699,8 @@ def stem(token):
 
 
 def meaningful_tokens(value):
-    return [stem(m.group()) for m in TOKEN_RE.finditer(value.lower()) if m.group().lower() not in ENGLISH_STOP_WORDS and m.group().lower() not in GENERIC and len(m.group()) > 2]
+    acronyms = {"ap", "ar", "ai", "hr", "it", "bi", "qa", "ux", "ui", "iv"}
+    return [stem(m.group()) for m in TOKEN_RE.finditer(value.lower()) if (m.group().lower() not in ENGLISH_STOP_WORDS or m.group().lower() in acronyms) and m.group().lower() not in GENERIC and len(m.group()) >= 2]
 
 
 def anchor_candidates(paragraph, dest, query_rows, profile):
@@ -1569,6 +1799,9 @@ def recommend(profile, options, log, check_cancel, state=None, metric_data=None)
     pages, aliases = state["pages"], state["aliases"]
     core = core_mapping(profile, aliases)
     if not core and not options.get("blog_to_blog"):
+        if options.get("automatic_setup"):
+            save_dataset(profile,"recommendations",[],input_signature=input_signature(profile,REC_INPUTS),warnings=["Choose core-page destinations before searching manual anchors."])
+            return
         raise ValueError("Add approved core pages, or explicitly enable blog-to-blog opportunities.")
     content = {r["url"]: r for r in dataset(profile, "content")["rows"] if r.get("success") and not r.get("noindex")}
     if not content:
@@ -1770,7 +2003,7 @@ def recommend_from_queries(profile, options, log, check_cancel, state=None, metr
         for query in queries.get(target, []):
             phrase = text_norm(query["query"])
             words = re.findall(r"\w+", phrase.casefold())
-            if (not words or len(words) > 12 or len(phrase) > 120 or not meaningful_tokens(phrase)
+            if (len(words) < 2 or len(words) > 12 or len(phrase) > 120 or not meaningful_tokens(phrase)
                     or phrase.casefold() in GENERIC_ANCHORS or brand_pattern(profile).search(phrase)
                     or re.search(r"[,;:!?()\[\]{}]", phrase)
                     or (len(words) == 1 and words[0] in (GENERIC | BAD_EDGE | VAGUE_TOPIC_WORDS))
@@ -1991,7 +2224,7 @@ def audit_links(profile, options, log, check_cancel, state=None, metric_data=Non
                 issue(kind, d, f"{'No HTTP response' if status == 0 else f'HTTP {status}'}; {p.get('indexability_status', '')}",
                       "Retry or verify manually before changing this link." if status in {0, 401, 403, 429} else "Review the intended destination; update the href to the valid preferred URL when appropriate.",
                       "High" if status in {404, 410} else "Review" if status in {401, 403, 429} else "High" if status >= 400 else "Review", link["source"], anchor,
-                      preferred_url=resolve_alias(d, state["aliases"]), link_position=link.get("position", ""))
+                      declared_canonical=p.get("canonical", ""), preferred_url=resolve_alias(d, state["aliases"]), link_position=link.get("position", ""))
     # Core URLs absent from every discovery source remain visible for investigation.
     known = {r["url"] for r in summary}
     for u in core:
@@ -2111,19 +2344,19 @@ def make_visual(profile, options):
 
 INSIGHT_INPUTS = ["pages", "links", "content", "gsc_pages", "gsc_total_pages", "gsc_queries", "sitemaps", "recommendations"]
 INSIGHT_FILTERS = ["Under-supported core", "No contextual inlinks", "Navigation/footer only", "Potential orphan",
-                   "Isolated group", "Buried core", "Missing hub link", "Cross-topic link review", "Link concentration", "Unassigned topic"]
+                   "Isolated group", "Buried core", "Missing hub link", "Cross-topic link review", "Link concentration", "Unassigned topic", "Topic without core page"]
 
 
 def insight_settings(profile):
     value = read_json(client_dir(profile) / "topic_settings.json", {})
     return {"names": value.get("names", {}), "assignments": value.get("assignments", {}),
-            "hubs": value.get("hubs", {}), "custom_clusters": value.get("custom_clusters", [])}
+            "hubs": value.get("hubs", {}), "custom_clusters": value.get("custom_clusters", []), "hidden": value.get("hidden", [])}
 
 
 def insight_signature(profile):
     # File stamps keep view changes cheap; no corpus hashing or network requests.
     stamps = {}
-    for name in INSIGHT_INPUTS + ["topic_settings", "reviews"]:
+    for name in INSIGHT_INPUTS + ["topic_settings", "core_settings", "reviews"]:
         path = client_dir(profile) / f"{name}.json"
         stamps[name] = (path.stat().st_mtime_ns, path.stat().st_size) if path.is_file() else None
     return digest({"version": INSIGHT_VERSION, "profile": profile, "files": stamps})
@@ -2149,92 +2382,110 @@ def insight_documents(profile, summary, content, queries):
     return documents
 
 
-def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None, state=None, metric_data=None):
-    """One cached, full-snapshot analysis. Graph display limits never affect it."""
+def insight_base_signature(profile):
+    names = [n for n in INSIGHT_INPUTS if n != "recommendations"]
+    stamps = {}
+    for name in names:
+        path = client_dir(profile) / f"{name}.json"
+        try:
+            stat = path.stat(); stamps[name] = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            stamps[name] = None
+    fields = {key: profile.get(key) for key in ["id", "name", "root_url", "allowed_hosts", "brand_terms", "blog_pattern", "blog_urls", "exclude_pattern"]}
+    return digest({"schema": INSIGHT_VERSION, "profile": fields, "inputs": stamps})
+
+
+def supporting_topic_groups(vectors, rows, features, check_cancel):
+    """Sparse nearest neighbors; inferred groups establish neither intent nor demand."""
+    import networkx as nx
+    from sklearn.neighbors import NearestNeighbors
+    eligible = [i for i, row in enumerate(rows) if row["valid_html"] and row["page_type"] != "Homepage" and not TAXONOMY_PATH.search(urlsplit(row["url"]).path)]
+    if vectors is None or len(eligible) < 2:
+        return []
+    data = vectors[eligible]
+    neighbors = NearestNeighbors(n_neighbors=min(6, len(eligible)), metric="cosine", algorithm="brute").fit(data)
+    pairs = {}
+    for start in range(0, len(eligible), 128):
+        check_cancel()
+        distances, indices = neighbors.kneighbors(data[start:start + 128])
+        for offset, (ds, js) in enumerate(zip(distances, indices)):
+            i = start + offset
+            pairs[i] = {int(j): 1-float(d) for d, j in zip(ds, js) if int(j) != i and 1-float(d) >= .25}
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(eligible)))
+    for i, matches in pairs.items():
+        for j, weight in matches.items():
+            # Union handles identical/tied documents: mutual top-k alone would
+            # leave most duplicates disconnected from their own topic.
+            previous = graph.get_edge_data(i, j, {}).get("weight", 0)
+            graph.add_edge(i, j, weight=max(previous, weight))
+    groups = []
+    communities = nx.community.louvain_communities(graph, weight="weight", seed=42) if graph.number_of_edges() else []
+    for members in communities:
+        if len(members) < 2:
+            continue
+        indices = [eligible[i] for i in sorted(members)]
+        weights = np.asarray(vectors[indices].mean(axis=0)).ravel()
+        terms, used = [], set()
+        for idx in np.argsort(weights)[::-1][:50]:
+            term = str(features[idx])
+            words = set(term.split())
+            if weights[idx] <= 0 or words <= used:
+                continue
+            terms.append(term); used.update(words)
+            if len(terms) == 2:
+                break
+        urls = [rows[i]["url"] for i in indices]
+        groups.append({"id": "inferred_"+digest(sorted(urls))[:12], "name": " / ".join(terms).title() or "Supporting topic", "members": urls})
+    return groups
+
+
+def read_insight_base(path, stamp, size):
+    # Only the app writes this local cache; uploaded crawl files are never unpickled.
+    with Path(path).open("rb") as handle:
+        base = pickle.load(handle)
+    if base.get("vectorizer") is not None:
+        base["vectorizer"].tokenizer = meaningful_tokens
+    return base
+
+
+def get_insight_base(profile, state=None, metric_data=None, check_cancel=lambda: None):
+    signature = insight_base_signature(profile)
+    path = client_dir(profile) / "explorer_base.pkl"
+    manifest = read_json(client_dir(profile) / "explorer_base_manifest.json", {})
+    if path.is_file() and manifest.get("signature") == signature:
+        try:
+            if UI_READS.get():
+                import streamlit as st
+                loader = st.cache_resource(show_spinner=False, max_entries=2)(read_insight_base)
+            else:
+                loader = read_insight_base
+            stat = path.stat()
+            base = loader(str(path), stat.st_mtime_ns, stat.st_size)
+            if base.get("signature") == signature:
+                return base
+        except (OSError, ValueError, TypeError, pickle.UnpicklingError, EOFError, AttributeError, ImportError):
+            pass
+    if UI_READS.get():
+        raise ValueError("The saved analysis base needs a refresh. Run Find opportunities; the UI will keep the last completed snapshot.")
     import networkx as nx
     from sklearn.feature_extraction.text import TfidfVectorizer
-    signature = insight_signature(profile)
-    profile = PreparedProfile(profile)
     state = state if state is not None else graph_state(profile)
     metrics, queries = metric_data if metric_data is not None else metric_maps(profile, state["aliases"])
-    root_page = state["pages"].get(state["home"], {})
-    reachability_known = root_page.get("status") == 200 and bool(root_page.get("html"))
     summary = page_summary(profile, state, (metrics, queries))
     by_url = {r["url"]: r for r in summary}
+    for row in summary:
+        row["valid_html"] = row["status_code"] == 200 and bool(row["indexable"]) and bool(state["pages"].get(row["url"], {}).get("html"))
     content = {resolve_alias(r["url"], state["aliases"]): r for r in dataset(profile, "content")["rows"] if r.get("success")}
-    settings = insight_settings(profile)
-    core = core_mapping(profile, state["aliases"])
-    definitions = {}
-    for url, entry in core.items():
-        if url not in by_url or is_home(url, profile):
-            continue
-        cid = "core_" + digest(url)[:12]
-        label = entry.get("topic") or by_url[url].get("h1") or urlsplit(url).path.strip("/").replace("-", " ")
-        definitions[cid] = {"id": cid, "name": settings["names"].get(cid, label), "default_hub": url}
-    for entry in settings["custom_clusters"]:
-        if entry.get("id") and text_norm(entry.get("name", "")):
-            cid = entry["id"]
-            definitions[cid] = {"id": cid, "name": settings["names"].get(cid, entry["name"]), "default_hub": entry.get("hub", "")}
-    documents = insight_documents(profile, summary, content, queries)
-    url_indices = {r["url"]: i for i, r in enumerate(summary)}
-    topic_ids = list(definitions)
-    topic_documents = []
-    for cid in topic_ids:
-        definition = definitions[cid]
-        hub = settings["hubs"].get(cid, definition["default_hub"])
-        topic_documents.append(" ".join([without_brand(definition["name"], profile)] * 6 +
-                                        ([documents[url_indices[hub]]] if hub in url_indices else [])))
-    primary, secondary, confidence = {}, {}, {}
-    vectors = None
-    log(f"Grouping {len(summary):,} known pages using body content, headings and visible GSC query themes.")
-    if summary and topic_documents:
+    documents = insight_documents(profile, [{**r, "topic": ""} for r in summary], content, queries)
+    vectorizer, vectors, features = None, None, []
+    if documents:
         try:
-            vectorizer = TfidfVectorizer(tokenizer=meaningful_tokens, token_pattern=None, ngram_range=(1, 2),
-                                         max_features=40000, sublinear_tf=True, dtype=np.float32)
-            matrix = vectorizer.fit_transform(documents + topic_documents)
-            vectors, centers = matrix[:len(summary)], matrix[len(summary):]
-            for start in range(0, len(summary), 128):
-                check_cancel()
-                scores = (vectors[start:start + 128] @ centers.T).toarray()
-                for offset, score in enumerate(scores):
-                    url = summary[start + offset]["url"]
-                    best = np.argsort(score)[::-1][:2]
-                    first = float(score[best[0]])
-                    primary[url] = topic_ids[int(best[0])] if first >= .12 else "unassigned"
-                    confidence[url] = "High" if first >= .35 and (len(best) == 1 or first - float(score[best[1]]) >= .06) else "Review" if first >= .12 else "Unassigned"
-                    if len(best) > 1 and float(score[best[1]]) >= max(.12, first * .75):
-                        secondary[url] = topic_ids[int(best[1])]
+            vectorizer = TfidfVectorizer(tokenizer=meaningful_tokens, token_pattern=None, ngram_range=(1,2), max_features=40000, sublinear_tf=True, dtype=np.float32)
+            vectors = vectorizer.fit_transform(documents)
+            features = vectorizer.get_feature_names_out()
         except ValueError:
             pass
-    # Core pages start as explicit hubs; users can correct memberships and hubs.
-    for cid, definition in definitions.items():
-        hub = definition["default_hub"]
-        if hub in by_url:
-            primary[hub], confidence[hub] = cid, "Core hub"
-    for url, cid in settings["assignments"].items():
-        url = resolve_alias(url_key(url), state["aliases"])
-        if url in by_url and (cid in definitions or cid == "unassigned"):
-            primary[url], confidence[url] = cid, "Reviewed"
-            secondary.pop(url, None)
-    for cid, url in settings["hubs"].items():
-        url = resolve_alias(url_key(url), state["aliases"])
-        if cid in definitions and url in by_url:
-            primary[url], confidence[url] = cid, "Reviewed hub"
-    for row in summary:
-        url = row["url"]
-        row["cluster_id"] = primary.get(url, "unassigned")
-        row["cluster"] = definitions.get(row["cluster_id"], {}).get("name", "Unassigned")
-        row["secondary_cluster_id"] = secondary.get(url, "")
-        row["cluster_confidence"] = confidence.get(url, "Unassigned")
-        row["content_available"] = url in content
-        if url not in content and row["cluster_confidence"] in {"High", "Review"}:
-            row["cluster_confidence"] = "Limited: title/URL only"
-        row["valid_html"] = row["status_code"] == 200 and bool(row["indexable"]) and bool(state["pages"].get(url, {}).get("html"))
-        row["word_count"] = len(content.get(url, {}).get("text", "").split())
-        row["active"] = not is_home(url, profile) and not excluded(url, profile) and (row["valid_html"] or row["status_code"] is None)
-        row["query_opportunities"] = sum(1 for q in queries.get(url, []) if finite_number(q.get("position"), 0) >= 4 and finite_number(q.get("position"), 0) <= 30 and finite_number(q.get("impressions"), 0) > 0)
-        row["query_opportunity_impressions"] = sum(float(q["impressions"]) for q in queries.get(url, []) if 4 <= finite_number(q.get("position"), 0) <= 30)
-        row["top_queries"] = queries.get(url, [])[:10]
     # Aggregate raw links by source/destination, retaining link-position evidence.
     edge_map, unknown_in, templates_in = {}, defaultdict(set), defaultdict(set)
     for link in dataset(profile, "links")["rows"]:
@@ -2270,9 +2521,138 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
     for index, group in enumerate(nx.weakly_connected_components(state["graph"].subgraph(unreachable)), 1):
         for url in group:
             isolated_groups[url] = (index, len(group))
+    parent = {child: previous for previous, child in nx.bfs_edges(state["graph"], state["home"])} if state["home"] in state["graph"] else {}
+    base = {"signature": signature, "state": state, "metrics": metrics, "queries": queries, "summary": summary,
+            "content": content, "documents": documents, "vectorizer": vectorizer, "vectors": vectors,
+            "edges": edges, "unknown_in": unknown_in, "templates_in": templates_in,
+            "incoming_context": incoming_context, "outgoing_context": outgoing_context, "isolated_groups": isolated_groups,
+            "parent": parent, "supporting_groups": supporting_topic_groups(vectors, summary, features, check_cancel)}
+    check_cancel()
+    if signature != insight_base_signature(profile):
+        raise ValueError("Crawl inputs changed while insights were being prepared. Showing the previous completed snapshot.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name+"."+uuid.uuid4().hex+".tmp")
+    try:
+        packed = dict(base)
+        if vectorizer is not None:
+            packed["vectorizer"] = copy.copy(vectorizer)
+            # Workers run as __main__, while UI/import contexts may use app.
+            # Rebind the tokenizer on load rather than pickle a module-local function.
+            packed["vectorizer"].tokenizer = None
+        with temp.open("wb") as handle:
+            pickle.dump(packed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    atomic_json(client_dir(profile)/"explorer_base_manifest.json", {"signature": signature})
+    return base
+
+
+def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None, state=None, metric_data=None):
+    """One cached, full-snapshot analysis. Graph display limits never affect it."""
+    import networkx as nx
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    signature = insight_signature(profile)
+    profile = PreparedProfile(profile)
+    base = get_insight_base(profile, state, metric_data, check_cancel)
+    state, metrics, queries = base["state"], base["metrics"], base["queries"]
+    content, documents, vectors = base["content"], base["documents"], base["vectors"]
+    root_page = state["pages"].get(state["home"], {})
+    reachability_known = root_page.get("status") == 200 and bool(root_page.get("html"))
+    summary = [dict(r) for r in base["summary"]]
+    current_core = core_mapping(profile, state["aliases"])
+    for row in summary:
+        u = row["url"]
+        row["page_type"] = "Homepage" if is_home(u, profile) else "Core" if u in current_core else "Blog" if is_blog(u, profile) else "Other"
+        row["topic"] = current_core.get(u, {}).get("topic", "")
+        row["business_priority"] = current_core.get(u, {}).get("priority", 1)
+    by_url = {r["url"]: r for r in summary}
+    settings = insight_settings(profile)
+    core = core_mapping(profile, state["aliases"])
+    definitions = {}
+    for url, entry in core.items():
+        if url not in by_url or is_home(url, profile) or TAXONOMY_PATH.search(urlsplit(url).path):
+            continue
+        cid = "core_" + digest(url)[:12]
+        label = entry.get("topic") or by_url[url].get("h1") or urlsplit(url).path.strip("/").replace("-", " ")
+        definitions[cid] = {"id": cid, "name": settings["names"].get(cid, label), "default_hub": url}
+    for entry in settings["custom_clusters"]:
+        if entry.get("id") and text_norm(entry.get("name", "")):
+            cid = entry["id"]
+            definitions[cid] = {"id": cid, "name": settings["names"].get(cid, entry["name"]), "default_hub": entry.get("hub", "")}
+    url_indices = {r["url"]: i for i, r in enumerate(summary)}
+    definitions = {cid: d for cid, d in definitions.items() if cid not in settings["hidden"]}
+    topic_ids = list(definitions)
+    topic_documents = []
+    for cid in topic_ids:
+        definition = definitions[cid]
+        hub = settings["hubs"].get(cid, definition["default_hub"])
+        topic_documents.append(" ".join([without_brand(definition["name"], profile)] * 6 +
+                                        ([documents[url_indices[hub]]] if hub in url_indices else [])))
+    primary, secondary, confidence = {}, {}, {}
+    log(f"Grouping {len(summary):,} known pages using body content, headings and visible GSC query themes.")
+    if summary and topic_documents and vectors is not None:
+        try:
+            centers = base["vectorizer"].transform(topic_documents)
+            for start in range(0, len(summary), 128):
+                check_cancel()
+                scores = (vectors[start:start + 128] @ centers.T).toarray()
+                for offset, score in enumerate(scores):
+                    url = summary[start+offset]["url"]
+                    best = np.argsort(score)[::-1][:2]
+                    first = float(score[best[0]])
+                    primary[url] = topic_ids[int(best[0])] if first >= .12 else "unassigned"
+                    confidence[url] = "High" if first >= .35 and (len(best)==1 or first-float(score[best[1]]) >= .06) else "Review" if first >= .12 else "Unassigned"
+                    if len(best)>1 and float(score[best[1]]) >= max(.12, first*.75):
+                        secondary[url] = topic_ids[int(best[1])]
+        except ValueError:
+            pass
+    # Core pages start as explicit hubs; users can correct memberships and hubs.
+    for cid, definition in definitions.items():
+        hub = definition["default_hub"]
+        if hub in by_url:
+            primary[hub], confidence[hub] = cid, "Core hub"
+    for group in base["supporting_groups"]:
+        cid = group["id"]
+        members = [u for u in group["members"] if primary.get(u, "unassigned") == "unassigned" and u not in settings["assignments"] and by_url[u]["page_type"] != "Core"]
+        saved = any(value == cid for value in settings["assignments"].values()) or cid in settings["names"] or cid in settings["hubs"]
+        if cid in settings["hidden"] or (len(members) < 2 and not saved):
+            continue
+        definitions[cid] = {"id": cid, "name": settings["names"].get(cid, group["name"]), "default_hub": "", "inferred": True}
+        for url in members:
+            primary[url], confidence[url] = cid, "Inferred topic; review"
+    for url, cid in settings["assignments"].items():
+        url = resolve_alias(url_key(url), state["aliases"])
+        if url in by_url and (cid in definitions or cid == "unassigned"):
+            primary[url], confidence[url] = cid, "Reviewed"
+            secondary.pop(url, None)
+    for cid, url in settings["hubs"].items():
+        url = resolve_alias(url_key(url), state["aliases"])
+        if cid in definitions and url in by_url:
+            primary[url], confidence[url] = cid, "Reviewed hub"
+    for row in summary:
+        url = row["url"]
+        row["cluster_id"] = primary.get(url, "unassigned")
+        row["cluster"] = definitions.get(row["cluster_id"], {}).get("name", "Unassigned")
+        row["secondary_cluster_id"] = secondary.get(url, "")
+        row["cluster_confidence"] = confidence.get(url, "Unassigned")
+        row["content_available"] = url in content
+        if url not in content and row["cluster_confidence"] in {"High", "Review"}:
+            row["cluster_confidence"] = "Limited: title/URL only"
+        row["valid_html"] = row["status_code"] == 200 and bool(row["indexable"]) and bool(state["pages"].get(url, {}).get("html"))
+        row["word_count"] = len(content.get(url, {}).get("text", "").split())
+        row["active"] = not is_home(url, profile) and not excluded(url, profile) and (row["valid_html"] or row["status_code"] is None)
+        row["query_opportunities"] = sum(1 for q in queries.get(url, []) if finite_number(q.get("position"), 0) >= 4 and finite_number(q.get("position"), 0) <= 30 and finite_number(q.get("impressions"), 0) > 0)
+        row["query_opportunity_impressions"] = sum(float(q["impressions"]) for q in queries.get(url, []) if 4 <= finite_number(q.get("position"), 0) <= 30)
+        row["top_queries"] = queries.get(url, [])[:10]
+    edges = base["edges"]
+    unknown_in, templates_in = defaultdict(set, base["unknown_in"]), defaultdict(set, base["templates_in"])
+    incoming_context, outgoing_context = defaultdict(set, base["incoming_context"]), defaultdict(set, base["outgoing_context"])
+    isolated_groups = base["isolated_groups"]
     review_state = read_json(client_dir(profile) / "reviews.json", {})
     recommendations = [{**r, **review_state.get(r["id"], {})} for r in dataset(profile, "recommendations")["rows"]]
-    recommendations = [r for r in recommendations if r.get("status") not in {"Dismissed", "Implemented"}]
+    excluded_cores = set(core_settings(profile)["exclude"])
+    recommendations = [r for r in recommendations if r.get("status") not in {"Dismissed", "Implemented"} and r.get("destination_url") not in excluded_cores]
     proposed = defaultdict(list)
     for rec in recommendations:
         proposed[resolve_alias(rec["destination_url"], state["aliases"])].append(rec)
@@ -2326,6 +2706,8 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
                 flags.append("Missing hub link")
             if cid == "unassigned":
                 flags.append("Unassigned topic")
+            elif definitions.get(cid, {}).get("inferred") and not row["hub_url"]:
+                flags.append("Topic without core page")
         row["flags"] = flags
         row["link_density"] = 1000 * len(outgoing_context[url]) / row["word_count"] if row["word_count"] >= 100 else None
     # Relative outliers are review signals, never an automatic "too many links" rule.
@@ -2395,6 +2777,8 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
         issues = []
         if not hub:
             issues.append("No confirmed main page")
+            if definition.get("inferred"):
+                issues.append("Topic without core page")
         if not support:
             issues.append("No validated supporting pages assigned")
         if support and hub and state["position_available"] and not unknown_support and linked_to / len(support) < .5:
@@ -2416,7 +2800,7 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
                          "unreachable_pages": sum("Potential orphan" in r["flags"] for r in members),
                          "zero_context_pages": sum("No contextual inlinks" in r["flags"] for r in members),
                          "needs_attention": bool(issues), "issues": issues,
-                         "next_action": "Choose and validate the appropriate main page." if not hub else "Review missing support links and the hub's useful onward links." if issues else "Review specific query opportunities; no broad cluster-structure issue was observed."})
+                         "next_action": "Review business fit, demand and whether this supporting topic needs a dedicated core page." if definition.get("inferred") and not hub else "Choose and validate the appropriate main page." if not hub else "Review missing support links and the hub's useful onward links." if issues else "Review specific query opportunities; no broad cluster-structure issue was observed."})
     parent = {v: u for u, v in nx.bfs_edges(state["graph"], state["home"])} if state["home"] in state["graph"] else {}
     warnings = ["Clusters are inferred from available content, headings and visible GSC queries; review memberships and main pages.",
                 "Coverage and contextual connectivity are measured separately. No Google topical-authority score is estimated.",
@@ -2429,8 +2813,8 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
         warnings.append("Link-position evidence is unavailable. Zero-context and navigation-only claims are withheld.")
     if not reachability_known:
         warnings.append("The homepage was not validated as accessible HTML. Orphan classification is withheld until the root crawl is checked.")
-    result = {"meta": {"signature": signature, "created_at": utc_now(), "version": INSIGHT_VERSION, "partial": partial, "warnings": warnings,
-                       "home": state["home"], "reachability_known": reachability_known, "known_pages": len(summary), "validated_pages": sum(r["valid_html"] for r in summary)},
+    result = {"meta": {"signature": signature, "created_at": utc_now(), "version": INSIGHT_VERSION, "base_signature": base["signature"], "partial": partial, "warnings": warnings,
+                       "home": state["home"], "reachability_known": reachability_known, "known_pages": len(summary), "validated_pages": sum(r["valid_html"] for r in summary), "core_settings_hash": digest(core_settings(profile))},
               "pages": summary, "clusters": clusters, "links": edges, "cross_reviews": cross_reviews,
               "recommendations": recommendations, "parents": parent}
     for name, rows in [("insight_pages", summary), ("insight_clusters", clusters), ("insight_reviews", cross_reviews)]:
@@ -2441,12 +2825,29 @@ def build_explorer_data(profile, log=lambda *_: None, check_cancel=lambda: None,
     return result
 
 
-def ensure_explorer_data(profile):
+def client_job_active(profile):
+    job_id = read_job_lock().get("job_id")
+    if not job_id or not job_for_client(job_id, profile["id"]):
+        return False
+    status = read_json(DATA_DIR / "jobs" / job_id / "status.json", {})
+    return status.get("state", "queued") in {"queued", "running"}
+
+
+def ensure_explorer_data(profile, cheap_only=False):
     manifest = read_json(client_dir(profile) / "explorer_manifest.json", {})
     path = client_dir(profile) / "explorer_snapshot.json"
-    if not path.is_file() or manifest.get("signature") != insight_signature(profile):
+    last = read_json(path) if path.is_file() else None
+    if client_job_active(profile):
+        return last
+    if last is not None and manifest.get("signature") == insight_signature(profile):
+        return last
+    base_meta = read_json(client_dir(profile) / "explorer_base_manifest.json", {})
+    if cheap_only and (not (client_dir(profile)/"explorer_base.pkl").is_file() or base_meta.get("signature") != insight_base_signature(profile)):
+        return last
+    with client_transaction(profile, timeout=0 if cheap_only else 30):
+        if client_job_active(profile):
+            return last
         return build_explorer_data(profile)
-    return read_json(path)
 
 
 def filter_insight_pages(snapshot, issues=None, page_type="All", clusters=None, search=""):
@@ -2461,8 +2862,9 @@ def seed_cluster_check(profile, seeds, snapshot):
     from sklearn.feature_extraction.text import TfidfVectorizer
     seeds = list(dict.fromkeys(text_norm(s) for s in seeds if text_norm(s)))[:20]
     pages = [r for r in snapshot["pages"] if r["active"] and r["valid_html"]]
-    content = {r["url"]: r for r in dataset(profile, "content")["rows"] if r.get("success")}
-    _, queries = metric_maps(profile, aliases_for(dataset(profile, "pages")["rows"], profile))
+    aliases = aliases_for(dataset(profile, "pages")["rows"], profile)
+    content = {resolve_alias(r["url"], aliases): r for r in dataset(profile, "content")["rows"] if r.get("success")}
+    _, queries = metric_maps(profile, aliases)
     docs = insight_documents(profile, pages, content, queries)
     results, details = [], []
     scores = np.zeros((len(seeds), len(pages)))
@@ -2617,7 +3019,7 @@ def workbook_bytes(profiles, sheets):
     for profile in profiles:
         for name in sheets:
             if name == "Run summary":
-                for stage in ["pages", "links", "sitemaps", "gsc_pages", "gsc_queries", "content", "recommendations", "audit", "insight_pages", "insight_clusters", "insight_reviews", "seed_checks"]:
+                for stage in ["pages", "links", "sitemaps", "gsc_pages", "gsc_queries", "content", "recommendations", "audit", "core_destinations", "insight_pages", "insight_clusters", "insight_reviews", "seed_checks"]:
                     doc = dataset(profile, stage)
                     if not doc["meta"]:
                         continue
@@ -2626,7 +3028,7 @@ def workbook_bytes(profiles, sheets):
                     collected[name].append({"client": profile["name"], "dataset": stage, "rows": len(doc["rows"]), "stale": stale,
                                              "created_at": doc["meta"].get("created_at"), "metadata": doc["meta"]})
                 continue
-            key = {"Recommendations": "recommendations", "Existing-link issues": "audit", "Page summary": "page_summary", "GSC pages": "gsc_pages", "GSC queries": "gsc_queries", "Content diagnostics": "content", "Existing links": "links",
+            key = {"Recommendations": "recommendations", "Existing-link issues": "audit", "Page summary": "page_summary", "GSC pages": "gsc_pages", "GSC queries": "gsc_queries", "Content diagnostics": "content", "Existing links": "links", "Destination checks": "core_destinations",
                    "Priority pages": "insight_pages", "Topic clusters": "insight_clusters", "Cluster link reviews": "insight_reviews", "Seed checks": "seed_checks"}[name]
             doc = dataset(profile, key)
             values = doc["rows"]
@@ -2781,7 +3183,8 @@ def worker_main(job_path):
     routines = {"crawl": run_sf, "sitemaps": discover_sitemaps, "gsc": download_gsc, "content": fetch_content, "recommendations": recommend, "audit": audit_links}
     try:
         if job.get("workflow") == "simple":
-            simple_pipeline(job, status, log, check_cancel, folder)
+            with client_transaction(job["profiles"][0]):
+                simple_pipeline(job, status, log, check_cancel, folder)
             return
         for profile in job["profiles"]:
             validate_profile(profile)
@@ -2813,6 +3216,7 @@ def worker_main(job_path):
         release_job_lock(job["id"])
         GOOGLE_CREDENTIALS_INFO = None
         IS_WORKER = False
+        close_crawl_pools()
 
 
 def install_demo():
@@ -2874,6 +3278,89 @@ def install_demo():
     return p
 
 
+def cleanup_generated_files(profile, exports_to_keep=6, crawls_to_keep=2):
+    """Retain recent app-generated outputs, never uploaded inputs or client data."""
+    keep_path = dataset_meta(profile, "result").get("workbook", "")
+    exports = client_dir(profile)/"exports"
+    if exports.is_dir():
+        paths = sorted((p for p in exports.glob("*.xlsx") if p.name.startswith(("internal_links_", "cluster_insights_"))), key=lambda p:p.stat().st_mtime_ns, reverse=True)
+        for path in paths[exports_to_keep:]:
+            if str(path) != keep_path:
+                path.unlink(missing_ok=True)
+    crawls = client_dir(profile)/"crawls"
+    if crawls.is_dir():
+        paths = sorted((p for p in crawls.iterdir() if p.is_dir() and re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{6}", p.name)), key=lambda p:p.stat().st_mtime_ns, reverse=True)
+        for path in paths[crawls_to_keep:]:
+            shutil.rmtree(path)
+
+
+def save_core_choices(profile, selected, detected, reset=False):
+    if client_job_active(profile):
+        raise ValueError("Wait for this client's run to finish before changing core pages.")
+    with client_transaction(profile, timeout=0):
+        if reset:
+            choices = {"include": [], "exclude": []}
+        else:
+            selected = list(dict.fromkeys(url_key(u) for u in selected if str(u).strip()))
+            if any(not same_site(u, profile) or is_home(u, profile) or TAXONOMY_PATH.search(urlsplit(u).path) or BINARY_PATH.search(u) for u in selected):
+                raise ValueError("Choose same-site page URLs. Homepages, category/tag archives, and files cannot be core destinations.")
+            previous = core_settings(profile)
+            choices = {"include": selected, "exclude": sorted((set(previous["exclude"]) | (set(detected)-set(selected))) - set(selected))}
+        atomic_json(client_dir(profile)/"core_settings.json", choices)
+        updated = dict(profile)
+        if reset:
+            updated["core_pages"] = []
+        infer_core_pages(updated, dataset(profile,"pages")["rows"], dataset(profile,"links")["rows"])
+        save_working_profile(updated, fields=["core_pages"])
+        return updated
+
+
+def core_destination_rows(profile, pages):
+    by_url = {p["url"]:p for p in pages}
+    result = []
+    for core in profile.get("core_pages", []):
+        page = by_url.get(core["url"], {})
+        canonical = page.get("canonical", "")
+        result.append({"client":profile["name"], "url":core["url"], "title":page.get("title", ""), "found_in":core.get("detected_from", ""),
+                       "selection":core.get("origin", "auto"), "eligibility":destination_issue(page), "status":page.get("status"),
+                       "canonical":canonical, "canonical_status":by_url.get(canonical,{}).get("status"), "indexable":page.get("indexable"),
+                       "action":"Eligible for contextual opportunities" if destination_issue(page)=="Eligible" else "Review the declared canonical, status and indexability before adding links."})
+    return result
+
+
+def render_core_editor(st, profile):
+    with st.expander("Core pages — review or change (optional)"):
+        if client_job_active(profile):
+            st.caption("Core-page editing is available when this client's run finishes.")
+            return
+        pages = dataset(profile,"pages")["rows"]
+        preview = dict(profile)
+        detected = infer_core_pages(preview, pages, dataset(profile,"links")["rows"])
+        selected_urls = [c["url"] for c in detected]
+        options = sorted(set(selected_urls) | {p["url"] for p in pages if p.get("status")==200 and p.get("html")
+                         and not is_home(p["url"],profile) and not TAXONOMY_PATH.search(urlsplit(p["url"]).path)})
+        st.caption("Solution, service, product and use-case pages are selected from current site evidence. Remove unwanted destinations or add a page. Selection does not override canonical/indexability checks.")
+        if detected:
+            st.dataframe(pd.DataFrame(core_destination_rows(preview,pages))[["url","found_in","eligibility","canonical"]], hide_index=True, width="stretch",
+                         column_config={"url":st.column_config.LinkColumn("Page"),"canonical":st.column_config.LinkColumn("Declared canonical")})
+        with st.form("core_choices_"+profile["id"]):
+            selected = st.multiselect("Core-page destinations",options,default=selected_urls)
+            extra = st.text_area("Add destination URLs (optional, one per line)", height=80,help="New URLs are fetched when you next click Find opportunities.")
+            save = st.form_submit_button("Save core pages")
+        if save:
+            try:
+                save_core_choices(profile, selected+[u.strip() for u in extra.splitlines() if u.strip()], selected_urls)
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+        if st.button("Reset to automatic selection",key="reset_core_"+profile["id"]):
+            try:
+                save_core_choices(profile,[],selected_urls,reset=True)
+                st.rerun()
+            except Exception as exc:
+                st.error(safe_error(exc))
+
+
 def recent_dataset(profile, name, hours=24):
     doc = dataset(profile, name)
     try:
@@ -2897,12 +3384,17 @@ def save_working_profile(profile, fields=None):
 
 def crawl_quality(pages_doc):
     rows = pages_doc.get("rows", [])
-    checked = [p for p in rows if not (300 <= p.get("status", 0) < 400)]
-    failed = sum(p.get("status", 0) == 0 or p.get("status", 0) >= 400 for p in checked)
+    checked = [p for p in rows if not (300 <= p.get("status", 0) < 400) and not p.get("robots_blocked")
+               and not str(p.get("indexability_status", "")).startswith("Blocked by robots.txt")]
+    failed = sum(p.get("status", 0) == 0 or p.get("status") == 429 or p.get("status", 0) >= 500 for p in checked)
     successful = sum(p.get("status") == 200 and p.get("html") for p in checked)
     ratio = failed / max(1, len(checked))
+    denied = sum(p.get("status") in {401, 403} for p in checked)
+    # Access restrictions deserve their own explanation, rather than being
+    # mistaken for a transport failure or masking a homepage-only snapshot.
     return {"checked": len(checked), "failed": failed, "successful_html": successful, "failure_ratio": ratio,
-            "cacheable": bool(successful) and ratio <= .20}
+            "robots_blocked": len(rows) - len(checked) - sum(300 <= p.get("status", 0) < 400 for p in rows),
+            "access_restricted": denied, "cacheable": bool(successful) and ratio <= .20}
 
 
 def cacheable_crawl(profile, pages_doc, links_doc):
@@ -2910,7 +3402,7 @@ def cacheable_crawl(profile, pages_doc, links_doc):
         return True
     meta, link_meta = pages_doc.get("meta", {}), links_doc.get("meta", {})
     # Invalidate older built-in classifications/locators on upgrade.
-    schema_ok = meta.get("source") != "Built-in HTML crawl" or meta.get("crawl_schema", 0) >= 2
+    schema_ok = meta.get("source") != "Built-in HTML crawl" or meta.get("crawl_schema", 0) >= CRAWL_SCHEMA
     mapping = aliases_for(pages_doc.get("rows", []), profile)
     root = resolve_alias(profile["root_url"], mapping)
     home = next((p for p in pages_doc.get("rows", []) if p["url"] == root), {})
@@ -2928,7 +3420,7 @@ def safe_error(exc):
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, TimeoutError) or type(current).__name__ in {"Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError"}:
-            return "Google took too long to respond. Retry this action. If authorization has expired, reconnect Google in the sidebar."
+            return "A network request took too long to respond. Retry this action. If authorization has expired, reconnect Google in the sidebar."
         current = current.__cause__ or current.__context__
     if type(exc).__name__ in {"RefreshError", "OAuthError", "TokenExpiredError"}:
         return "Google authorization expired or was revoked. Reconnect Google in Connection & crawl options."
@@ -2984,6 +3476,7 @@ def simple_pipeline(job, status, log, check_cancel, folder):
         infer_core_pages(profile, dataset(profile, "pages")["rows"], dataset(profile, "links")["rows"])
         progress(1, 1, "Using the saved crawl; reading navigation and footer links.")
     else:
+        profile["blog_urls"] = []
         try:
             # Respect root robots directives before downloading the homepage.
             origin = urlunsplit((*urlsplit(profile["root_url"])[:2], "", "", ""))
@@ -3004,7 +3497,7 @@ def simple_pipeline(job, status, log, check_cancel, folder):
         except Cancelled:
             raise
         except Exception as exc:
-            if options.get("runtime_mode") != "local":
+            if profile.get("main_selector") or options.get("runtime_mode") != "local":
                 raise ValueError(f"Could not read the website: {safe_error(exc)}") from exc
             warnings.append("Homepage HTML could not be read; using the local Screaming Frog crawl to identify navigation links.")
     if not profile.get("demo") and GOOGLE_CREDENTIALS_INFO and profile.get("gsc_property") and not recent_dataset(profile, "gsc_total_pages"):
@@ -3048,11 +3541,11 @@ def simple_pipeline(job, status, log, check_cancel, folder):
     infer_core_pages(profile, pages, dataset(profile, "links")["rows"])
     detect_proprietary_product_brands(profile, dataset(profile, "content")["rows"])
     if not profile.get("core_pages"):
-        quality = crawl_quality(dataset(profile, "pages"))
-        if not quality["cacheable"]:
-            statuses = Counter(str(p.get("status", 0)) for p in pages if p.get("status", 0) == 0 or p.get("status", 0) >= 400)
-            raise ValueError(f"Crawl coverage is insufficient: {quality['successful_html']} usable HTML pages; {quality['failed']} unverified/failed requests ({dict(statuses)}). Retry after checking access/rate limits, or import Screaming Frog exports.")
-        raise ValueError("No eligible core pages were found in the observed navigation/footer. Check crawl scope and menu HTML; a rendered Screaming Frog crawl or exports may be needed.")
+        warnings.append("No commercial core pages were confirmed. Audits and topic-gap clusters are still available; review Core pages to select the destinations you want.")
+    blocked = [c for c in profile.get("core_pages", []) if c.get("eligibility") != "Eligible"]
+    if blocked:
+        warnings.append(f"{len(blocked)} core page(s) need destination checks before automatic links can be suggested. See Core pages and the Destination checks worksheet for canonicals, HTTP status or indexability evidence.")
+    save_dataset(profile,"core_destinations",core_destination_rows(profile,pages))
     save_working_profile(profile, fields=["root_url", "core_pages", "blog_urls", "brand_terms", "automatic_setup"])
     status["core_pages"] = len(profile["core_pages"])
     indexable_urls = {p["url"] for p in pages if p.get("indexable")}
@@ -3091,7 +3584,7 @@ def simple_pipeline(job, status, log, check_cancel, folder):
     insights = build_explorer_data(profile, log, check_cancel, state=state, metric_data=metric_data)
     progress(1, 2, "Page decisions and cluster analysis are ready; maps render only when inspected.")
     save_dataset(profile, "visuals", [], rendering="On demand from saved explorer snapshot")
-    workbook = workbook_bytes([profile], ["Recommendations", "Priority pages", "Topic clusters", "Cluster link reviews", "GSC queries", "GSC pages", "Existing-link issues", "Page summary", "Run summary"])
+    workbook = workbook_bytes([profile], ["Recommendations", "Priority pages", "Topic clusters", "Cluster link reviews", "GSC queries", "GSC pages", "Destination checks", "Existing-link issues", "Page summary", "Run summary"])
     output = client_dir(profile) / "exports" / f"internal_links_{job['id']}.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(workbook)
@@ -3100,13 +3593,17 @@ def simple_pipeline(job, status, log, check_cancel, folder):
             warnings.append("This run covers a limited selection of pages. Coverage and limits are included in the workbook.")
     failures = dataset(profile, "pages")["meta"].get("failed", 0)
     if failures:
-        warnings.append(f"{failures} page requests failed or were blocked. Results cover pages that could be read.")
+        warnings.append(f"{failures} page requests had network/rate-limit/server failures. Results cover pages that could be read.")
+    access_restricted = crawl_quality(dataset(profile,"pages"))["access_restricted"]
+    if access_restricted:
+        warnings.append(f"{access_restricted} URL(s) returned HTTP 401/403. These are access restrictions, not proof of broken pages; check coverage before using the findings.")
     warnings.extend(dataset(profile, "recommendations")["meta"].get("warnings", []))
     warnings.extend(insights["meta"]["warnings"])
     save_dataset(profile, "result", [], workbook=str(output), warnings=list(dict.fromkeys(warnings)), job_id=job["id"],
-                 core_pages=status["core_pages"], blogs=status["blogs"], anchor_text=options.get("anchor_text", ""),
+                 core_settings_hash=digest(core_settings(profile)), core_pages=status["core_pages"], blogs=status["blogs"], anchor_text=options.get("anchor_text", ""),
                  query_pairs=len(dataset(profile, "gsc_queries")["rows"]), matching_strategy=dataset(profile, "recommendations")["meta"].get("matching_strategy", "manual_anchor"),
                  opportunities=len(dataset(profile, "recommendations")["rows"]), crawl_source=dataset(profile, "pages")["meta"].get("source"))
+    cleanup_generated_files(profile)
     status.update(state="completed", overall_progress=1, phase_progress=1, done=2, total=2, warnings=list(dict.fromkeys(warnings)),
                   finished_at=utc_now(), message="Opportunities, analysis, charts and workbook are ready.")
     publish()
@@ -3252,8 +3749,33 @@ def finish_google_authorization(pending, response):
     return token
 
 
+def google_return_response(value, expected_redirect):
+    """Parse a manually returned code without logging or displaying the address."""
+    try:
+        actual, expected = urlsplit(str(value).strip()), urlsplit(expected_redirect)
+        def origin(parts):
+            return parts.scheme.lower(), (parts.hostname or "").lower(), parts.port or (443 if parts.scheme == "https" else 80)
+        def callback_path(path):
+            return re.sub(r"/index\.html$", "/", path).rstrip("/")
+        if (len(str(value)) > 8192 or actual.username or actual.password or actual.fragment
+                or origin(actual) != origin(expected) or actual.path not in GOOGLE_CALLBACK_PATHS
+                or callback_path(actual.path) != callback_path(expected.path)):
+            raise ValueError
+        params = dict(parse_qsl(actual.query, keep_blank_values=True))
+        pairs = parse_qsl(actual.query, keep_blank_values=True)
+        if any(sum(key == field for key, _ in pairs) > 1 for field in ("code", "state", "error")):
+            raise ValueError
+        if not params.get("state") or not (params.get("code") or params.get("error")):
+            raise ValueError
+        if params.get("iss") not in {None, "https://accounts.google.com", "accounts.google.com"}:
+            raise ValueError
+        return {key: params[key] for key in ("code", "state", "error") if key in params}
+    except (ValueError, TypeError):
+        raise ValueError("Paste the final address from the tab Google opened after you approved access. Use the address that starts with your Streamlit app URL.") from None
+
+
 def google_authorize_button(pending):
-    """Popup with canonical callback matching; no secret is sent to the UI."""
+    """User-clicked new-tab sign-in; no client secret is sent to the UI."""
     # Keep the previously registered callback URL working. This import registers
     # the package's callback asset; our component handles the popup and return.
     import streamlit_oauth  # noqa: F401
@@ -3271,10 +3793,10 @@ def google_authorize_button(pending):
 
 def google_popup_error(response):
     messages = {
-        "popup_blocked": "Your browser blocked the Google sign-in popup. Allow popups for this app, then click Connect Google again.",
-        "popup_closed": "The Google popup closed before the app received its response. Click Connect Google again.",
-        "popup_timeout": "Google has not returned to this app. Close the previous popup and click Restart Google sign-in.",
-        "popup_unavailable": "The browser could not return Google sign-in to this app. Click Restart Google sign-in.",
+        "popup_blocked": "The browser did not open the sign-in tab. Click Open Google in a new tab below.",
+        "popup_closed": "The sign-in tab closed or the browser separated it from this app. Use Open Google in a new tab and the return-address option below if needed.",
+        "popup_timeout": "Google has not returned yet. Finish in the Google tab, then use the return-address option below if the app does not reconnect.",
+        "popup_unavailable": "The browser could not reconnect the Google tab automatically. Use the return-address option below.",
         "invalid_connection": "The Google sign-in could not start. Click Restart Google sign-in.",
     }
     return messages.get(response.get("_ui_error"), messages["invalid_connection"])
@@ -3323,11 +3845,23 @@ def render_google_connection(st, config, runtime, password, info, uploaded=None)
             pending["identity"] = identity
             st.session_state["_google_pending"] = pending
         response = google_authorize_button(pending)
-        st.caption("Waiting for Google sign-in. Keep this app tab open. Connecting only loads your client list; no crawl runs yet.")
+        st.link_button("Open Google in a new tab", pending["authorization_url"],
+                       help="Direct browser link. If the app does not reconnect after approval, use the return-address option below.", width="stretch")
+        st.caption("Connecting loads your client list. No crawl starts yet.")
+        with st.expander("If sign-in does not reconnect"):
+            st.write("Open Google in a new tab and approve access. When Google returns to this app's address in that tab, copy that final address and paste it here. Keep this original app tab open.")
+            with st.form("google_return_" + pending["id"], clear_on_submit=True):
+                returned = st.text_input("Google return address", type="password", help="The address contains a one-time code. Paste it only in this field.")
+                finish_return = st.form_submit_button("Finish Google connection")
+            if finish_return:
+                try:
+                    response = google_return_response(returned, redirect)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
         if st.button("Restart Google sign-in", key="google_restart"):
             st.session_state.pop("_google_pending", None)
             st.rerun()
-        st.caption("If you already approved access but the popup stays open, close that popup and restart sign-in. The return URL in Google Cloud and Streamlit Secrets must match exactly.")
         if isinstance(response, dict) and response.get("_ui_error"):
             st.warning(google_popup_error(response))
             return
@@ -3464,18 +3998,23 @@ def run_google_connection(st, info=None, client_config=None, pending=None, respo
             cancelled.set()
 
 
-def read_explorer_snapshot(path, stamp):
-    return read_json(path)
-
-
 def explorer_for_ui(st, profile):
-    manifest = read_json(client_dir(profile) / "explorer_manifest.json", {})
     path = client_dir(profile) / "explorer_snapshot.json"
-    if not path.is_file() or manifest.get("signature") != insight_signature(profile):
-        with st.spinner("Preparing insights from the saved crawl and GSC data…"):
-            build_explorer_data(profile)
-    loader = st.cache_data(show_spinner=False, max_entries=3)(read_explorer_snapshot)
-    return loader(str(path), path.stat().st_mtime_ns)
+    try:
+        last = read_json(path) if path.is_file() else None
+    except (OSError, ValueError):
+        last = None
+    if client_job_active(profile):
+        st.info("Analysis is running. Showing the last completed insights; edits will be available when it finishes.")
+        return last
+    try:
+        snapshot = ensure_explorer_data(profile, cheap_only=True)
+        if snapshot and snapshot["meta"].get("signature") != insight_signature(profile):
+            st.caption("Showing the last completed insights. Click Find opportunities to refresh changed crawl inputs.")
+        return snapshot
+    except Exception:
+        st.warning("The saved crawl is changing or the insight update could not finish. Showing the previous completed insights; run Find opportunities to refresh them.")
+        return last
 
 
 def insight_table(rows):
@@ -3593,6 +4132,8 @@ def render_priority_pages(st, profile, snapshot):
 
 
 def render_cluster_editor(st, profile, snapshot):
+    if client_job_active(profile):
+        return
     with st.expander("Correct clusters or main pages (optional)"):
         names = {c["cluster_id"]: c["cluster"] for c in snapshot["clusters"]}
         urls = [r["url"] for r in snapshot["pages"] if r["active"] and r["valid_html"]]
@@ -3617,6 +4158,13 @@ def render_cluster_editor(st, profile, snapshot):
                                     cfg["hubs"][other] = ""
                         atomic_json(client_dir(profile) / "topic_settings.json", cfg)
                         st.rerun()
+            if st.button("Remove this cluster", key="remove_cluster_"+profile["id"]+cid):
+                cfg = insight_settings(profile)
+                cfg["hidden"] = list(dict.fromkeys(cfg["hidden"]+[cid]))
+                cfg["assignments"] = {u:c for u,c in cfg["assignments"].items() if c != cid}
+                cfg["hubs"].pop(cid,None)
+                atomic_json(client_dir(profile)/"topic_settings.json",cfg)
+                st.rerun()
             with st.form("page_assignment_" + profile["id"]):
                 page = st.selectbox("Page to assign", urls)
                 assignment = st.selectbox("Assign to", ["unassigned"] + list(names), format_func=lambda c: names.get(c, "Unassigned / no confident topic"))
@@ -3683,7 +4231,7 @@ def render_cluster_explorer(st, profile, snapshot):
         st.caption("Searches the saved content and visible GSC queries. It does not crawl again or establish search volume for missing topics.")
         with st.form("seed_check_" + profile["id"]):
             seed_text = st.text_area("Seed keywords — one per line, up to 20", placeholder="document scanning\ninvoice processing")
-            submitted = st.form_submit_button("Check seed topics")
+            submitted = st.form_submit_button("Check seed topics", disabled=client_job_active(profile))
         if submitted:
             seeds = [s.strip() for s in seed_text.splitlines() if s.strip()]
             if not seeds:
@@ -3705,21 +4253,27 @@ def render_cluster_explorer(st, profile, snapshot):
     export_key = digest([snapshot["meta"]["signature"], dataset(profile, "seed_checks")["meta"].get("created_at")])[:16]
     output = client_dir(profile) / "exports" / f"cluster_insights_{export_key}.xlsx"
     if not output.is_file():
+        if client_job_active(profile):
+            st.caption("The cluster workbook will be available when analysis finishes.")
+            return
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(workbook_bytes([profile], ["Priority pages", "Topic clusters", "Cluster link reviews", "Seed checks"]))
+        cleanup_generated_files(profile)
     st.download_button("Download current cluster insights", output.read_bytes(), file_name=output.name,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", on_click="ignore")
 
 
 def render_simple_results(st, profile):
-    result = dataset(profile, "result")["meta"]
+    result = dataset_meta(profile, "result")
     if not result:
         st.caption("Select a client and click Find opportunities. Core pages, analysis, charts and workbook are prepared automatically.")
         return
-    crawl_meta = dataset(profile, "pages")["meta"]
-    if crawl_meta.get("source") == "Built-in HTML crawl" and crawl_meta.get("crawl_schema", 0) < 2:
+    crawl_meta = dataset_meta(profile, "pages")
+    if crawl_meta.get("source") == "Built-in HTML crawl" and crawl_meta.get("crawl_schema", 0) < CRAWL_SCHEMA:
         st.warning("This saved crawl uses the older link classifier. Click Find opportunities to rebuild the crawl, locators, recommendations and graphs before using these results.")
         return
+    if result.get("core_settings_hash") and result["core_settings_hash"] != digest(core_settings(profile)):
+        st.warning("Core-page choices changed. Click Find opportunities to regenerate recommendations and the main workbook.")
     cols = st.columns(4)
     for column, label, key in zip(cols, ["Blog pages checked", "Core pages detected", "GSC page/query pairs", "Link opportunities"], ["blogs", "core_pages", "query_pairs", "opportunities"]):
         column.metric(label, result.get(key, 0))
@@ -3735,11 +4289,14 @@ def render_simple_results(st, profile):
             for warning in result["warnings"]:
                 st.write(warning)
     snapshot = explorer_for_ui(st, profile)
+    if not snapshot:
+        st.info("Insights will be available after Find opportunities finishes. You can still review core-page choices above.")
+        return
     tabs = st.tabs(["Priority pages", "Opportunities", "GSC queries", "Clusters"])
     with tabs[0]:
         render_priority_pages(st, profile, snapshot)
-    recs = dataset(profile, "recommendations")["rows"]
-    rec_meta = dataset(profile, "recommendations")["meta"]
+    recs = snapshot["recommendations"]
+    rec_meta = dataset_meta(profile, "recommendations")
     with tabs[1]:
         if not result.get("anchor_text") and rec_meta.get("matching_strategy") != "gsc_exact_queries":
             st.warning("These saved recommendations predate the exact GSC query workflow. Click Find opportunities to rebuild them.")
@@ -3841,6 +4398,7 @@ def render_live_progress(st, job_id, client_id):
     monitor()
 
 
+@ui_reads()
 def main():
     import streamlit as st
     st.set_page_config(page_title="Internal linking opportunities", page_icon="🔗", layout="wide")
@@ -3932,9 +4490,12 @@ def main():
                 content_csv = st.file_uploader("Optional HTML extraction CSV (Address + HTML)", type="csv")
                 if st.button("Use these crawl files", disabled=internal_csv is None or inlinks_csv is None):
                     try:
-                        save_crawl(current_profile, read_sf_csv(io.BytesIO(internal_csv.getvalue())), read_sf_csv(io.BytesIO(inlinks_csv.getvalue())), "Imported Screaming Frog exports")
-                        if content_csv:
-                            import_html_csv(current_profile, io.BytesIO(content_csv.getvalue()))
+                        if client_job_active(current_profile):
+                            raise ValueError("Wait for this client's run to finish before replacing its crawl.")
+                        with client_transaction(current_profile, timeout=0):
+                            save_crawl(current_profile, read_sf_csv(io.BytesIO(internal_csv.getvalue())), read_sf_csv(io.BytesIO(inlinks_csv.getvalue())), "Imported Screaming Frog exports")
+                            if content_csv:
+                                import_html_csv(current_profile, io.BytesIO(content_csv.getvalue()))
                         st.success("Crawl imported. Click Find opportunities to prepare all results.")
                     except Exception as exc:
                         st.error(safe_error(exc))
@@ -3948,6 +4509,7 @@ def main():
             render_google_connection(st, config, runtime, password, info, uploaded)
         except (ValueError, ImportError) as exc:
             st.error(safe_error(exc))
+    st.sidebar.caption(f"v{APP_VERSION}")
     if not profiles:
         st.info("Click Connect Google in the sidebar to load your clients. You can also add a website or try the demo under Connection & crawl options.")
         return
@@ -3962,6 +4524,7 @@ def main():
     profile = next(p for p in profiles if p["id"] == selected)
     if profile.get("demo"):
         st.info("Demo: all pages and metrics are synthetic. No external crawl or Google request will run.")
+    render_core_editor(st, profile)
     anchor = st.text_input("Anchor text (optional)", placeholder="Leave blank for automatic suggestions, or enter e.g. options data API")
     destination = ""
     if anchor and profile.get("core_pages"):
