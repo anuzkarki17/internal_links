@@ -1,20 +1,28 @@
-streamlit>=1.50
-pandas>=2.2
-numpy>=1.26
-scikit-learn>=1.4
-networkx>=3.2
-scipy>=1.11
-requests>=2.32
-urllib3>=2.2
-beautifulsoup4>=4.12
-lxml>=5.2
-openpyxl>=3.1
-plotly>=5.22
-filelock>=3.13
-psutil>=5.9
-streamlit-oauth>=0.1.14
-google-auth>=2.30
-google-auth-oauthlib>=1.2
-google-auth-httplib2>=0.2
-google-api-python-client>=2.130
-httplib2>=0.20
+# One-click internal linking app: put beside app.py. Python 3.11 or 3.12 recommended.
+# Tested with callable (deferred) downloads, so large AI briefs build only on click.
+streamlit>=1.67,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+scipy>=1.12,<2
+scikit-learn>=1.4,<2
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+requests>=2.32,<3
+openpyxl>=3.1,<4
+networkx>=3.3,<4
+plotly>=5.24,<8
+google-api-python-client>=2.150,<3
+google-auth>=2.35,<3
+google-auth-oauthlib>=1.2,<2
+google-auth-httplib2>=0.2,<1
+# Pinned: supplies the Google sign-in popup; token exchange stays in google-auth-oauthlib.
+streamlit-oauth==0.1.14
+psutil>=5.9,<8
+tzdata>=2024.1
+
+# Optional semantic matching (additional download and memory):
+# sentence-transformers>=3.3,<6
+
+# Safe direct crawl transport and cross-process registry/queue locks
+urllib3>=2.2,<3
+filelock>=3.16,<4
